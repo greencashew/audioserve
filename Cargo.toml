@@ -62,6 +62,7 @@ transcoding-cache=["simple-file-cache", "bytes"]
 libavformat = ["media_info"]
 folder-download = ["async-tar"]
 chapters = ["libavformat"]
+static = ["media_info/static"]
 
 
 [profile.release]
