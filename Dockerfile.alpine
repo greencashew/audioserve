@@ -1,16 +1,17 @@
 FROM alpine:edge AS build
 MAINTAINER Ivan <ivan@zderadicka.eu>
 
-ARG FEATURES
+ARG CARGO_ARGS
 
 RUN apk update &&\
     apk add git bash openssl openssl-dev taglib taglib-dev curl yasm build-base \
-    wget libbz2 bzip2-dev  zlib zlib-dev rust cargo ffmpeg-dev
+    wget libbz2 bzip2-dev  zlib zlib-dev rust cargo ffmpeg-dev ffmpeg
 
 COPY . /audioserve 
 WORKDIR /audioserve
 
-RUN cargo build --release ${FEATURES}
+RUN cargo build --release ${CARGO_ARGS} &&\
+    cargo test --release ${CARGO_ARGS}
 
 RUN mkdir /ssl &&\
     cd /ssl &&\

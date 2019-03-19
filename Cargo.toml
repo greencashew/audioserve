@@ -40,6 +40,7 @@ cachedirtree = {git="https://github.com/izderadicka/cachedirtree.git", optional=
 bytes = {version="0.4", optional=true}
 
 media_info = {git="https://github.com/izderadicka/media_info", optional=true, branch="static"}
+#media_info = {path="/home/ivan/tmp/media_info", optional=true}
 
 [dependencies.simple-file-cache]
 #path="../file-cache"
@@ -63,7 +64,7 @@ libavformat = ["media_info"]
 folder-download = ["async-tar"]
 chapters = ["libavformat"]
 static = ["media_info/static"]
-
+partially-static = ["media_info/partially-static"]
 
 [profile.release]
 lto = true
