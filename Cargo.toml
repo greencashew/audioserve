@@ -39,7 +39,7 @@ cachedirtree = {git="https://github.com/izderadicka/cachedirtree.git", optional=
 
 bytes = {version="0.4", optional=true}
 
-media_info = {git="https://github.com/izderadicka/media_info", optional=true}
+media_info = {git="https://github.com/izderadicka/media_info", optional=true, branch="static"}
 
 [dependencies.simple-file-cache]
 #path="../file-cache"
