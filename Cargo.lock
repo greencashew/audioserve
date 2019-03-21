@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "audioserve"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-tar 0.1.0 (git+https://github.com/izderadicka/async-tar.git)",
  "bytes 0.4.12 (registry+https://github.com/rust-lang/crates.io-index)",

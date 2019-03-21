@@ -4,3 +4,4 @@ npm-debug.log
 **/node_modules
 Dockerfile*
 README.md
+_static_build

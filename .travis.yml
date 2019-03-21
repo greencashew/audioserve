@@ -12,7 +12,7 @@ before_install:
 #cache: cargo
 script:
   - cargo test --verbose
-  - cargo test --verbose --all-features
+  - cargo test --verbose --features transcoding-cache
   - cargo test --verbose --no-default-features
 matrix:
   fast_finish: true
