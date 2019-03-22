@@ -191,7 +191,7 @@ Install required dependencies (some dependecies are optional, depending on featu
 
     # Ubuntu - for other distros look for equivalent packages
     sudo apt-get install -y  openssl libssl-dev \
-        ffmpeg yasm build-essential wget libbz2-dev libavformat-dev
+        ffmpeg yasm build-essential wget libbz2-dev zlib1g-dev libavformat-dev
 
 Clone repo with:
 
