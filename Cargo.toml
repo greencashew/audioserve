@@ -5,7 +5,7 @@ authors = ["Ivan <ivan.zderadicka@gmail.com>"]
 
 [dependencies]
 pretty_env_logger = "0.3.0"
-log = "0.4"
+log = {version="0.4", features = ["release_max_level_info"]}
 hyper = "0.12"
 hyperx= "0.14.0"
 futures = "0.1"
