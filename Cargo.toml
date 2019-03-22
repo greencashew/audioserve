@@ -35,23 +35,19 @@ taglib = {version="1.0", optional=false}
 tokio-tls = {version="0.2", optional=true}
 native-tls = {version="0.2", optional=true}
 
-cachedirtree = {git="https://github.com/izderadicka/cachedirtree.git", optional=true}
+cachedirtree = {path="crates/cachedirtree", optional=true}
 
 bytes = {version="0.4", optional=true}
 
-media_info = {git="https://github.com/izderadicka/media_info", optional=true, branch="static"}
-#media_info = {path="/home/ivan/tmp/media_info", optional=true}
+media_info = {path="crates/media_info", optional=true}
 
 [dependencies.simple-file-cache]
-#path="../file-cache"
-git="https://github.com/izderadicka/simple-file-cache.git"
+path="crates/file-cache"
 features=["asynch"]
-#version="0.1.3"
 optional=true
 
 [dependencies.async-tar]
-#path="../async-tar"
-git="https://github.com/izderadicka/async-tar.git"
+path="crates/async-tar"
 optional=true
 
 [features]

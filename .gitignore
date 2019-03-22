@@ -1,5 +1,5 @@
 
-/target/
+**/target/
 **/*.rs.bk
 .vscode
 *.old
@@ -9,3 +9,4 @@ client/dist/bundle.js
 *.log
 rls/
 _static_build
+/crates/**/Cargo.lock
