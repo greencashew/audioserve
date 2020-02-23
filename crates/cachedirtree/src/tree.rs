@@ -158,7 +158,7 @@ impl<'a> SearchResult<'a> {
     fn has_match(&mut self) -> bool {
         let mut matched = vec![];
         let mut res = true;
-        let matched_terms = self.matched_terms_stack.last().unwrap();
+        let mut matched_terms = self.matched_terms_stack.last().unwrap().clone();
         self.search_terms.iter().enumerate().for_each(|(i, term)| {
             if !matched_terms[i] {
                 let contains = self.current_node.value().search_tag.contains(term);
@@ -176,7 +176,6 @@ impl<'a> SearchResult<'a> {
             res
         );
         if !res && !matched.is_empty() {
-            let mut matched_terms = matched_terms.clone();
             matched.into_iter().for_each(|i| matched_terms.set(i, true));
             self.new_matched_terms = Some(matched_terms);
         } else {
