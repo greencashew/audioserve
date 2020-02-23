@@ -220,10 +220,10 @@ impl DirTree {
         {
             let mut root = cached.root_mut();
 
-            fn add_entries<P: AsRef<Path>>(
+            fn add_entries(
                 node: &mut NodeMut<DirEntry>,
                 root_dir: &Path,
-                path: P,
+                path: &Path,
                 opts: &Options,
                 mut recents: Option<&mut BinaryHeap<DirEntryTimed>>,
             ) -> Result<(), io::Error> {
@@ -233,8 +233,8 @@ impl DirTree {
                         if file_type.is_dir() {
                             let mut dir_node = node.append(e.file_name().to_string_lossy().into());
                             let p = e.path();
-                            match recents.take() {
-                                Some(r) => {
+                            match recents {
+                                Some(ref mut r) => {
                                     if let Ok(meta) = p.metadata() {
                                         if let Ok(changed) = meta.modified() {
                                             if r.len() >= opts.recent_list_size {
@@ -247,12 +247,13 @@ impl DirTree {
                                         }
                                     }
                                     add_entries(&mut dir_node, root_dir, &p, opts, Some(r))?;
-                                    recents = Some(r);
+                                    
                                 }
                                 None => {
                                     add_entries(&mut dir_node, root_dir, &p, opts, None)?;
                                 }
                             }
+                        // TODO: now should also consider single book file - m4b etc.
                         } else if opts.include_files && file_type.is_file() {
                             node.append(e.file_name().to_string_lossy().into());
                         }
