@@ -51,7 +51,7 @@ impl Cache {
         let mut c = self.inner.write().expect("Cannot lock cache");
         c.add(key.clone()).map(move |file| FileGuard {
             cache: self.inner.clone(),
-            file: file,
+            file,
             key,
         })
     }
@@ -97,6 +97,10 @@ impl Cache {
 
     pub fn len(&self) -> u64 {
         self.inner.read().unwrap().num_files
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn max_size(&self) -> u64 {
@@ -178,7 +182,7 @@ fn gen_cache_key() -> String {
     let mut random = [0; FILE_KEY_LEN];
     let mut rng = rand::thread_rng();
     rng.fill_bytes(&mut random);
-    return BASE64URL_NOPAD.encode(&random);
+    BASE64URL_NOPAD.encode(&random)
 }
 
 fn entry_path_helper<P: AsRef<Path>>(root: &PathBuf, file_key: P) -> PathBuf {
@@ -316,6 +320,7 @@ impl CacheInner {
         get_cleanup!(self, res, file_name, key)
     }
 
+    #[allow(dead_code)]
     fn get2<S: AsRef<str>>(&mut self, key: S) -> Option<Result<(fs::File, PathBuf)>> {
         let file_name = self.get_entry_path(&key);
         let res = file_name.as_ref().map(|file_name| {
@@ -701,5 +706,4 @@ mod tests {
 
         assert_eq!(0, list_path())
     }
-
 }

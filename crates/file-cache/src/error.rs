@@ -10,7 +10,7 @@ quick_error! {
             display("io error: {}", err)
         }
 
-        
+
         KeyAlreadyExists(key: String) {
             display("key {} exists", key)
         }
@@ -36,9 +36,8 @@ quick_error! {
         }
     }
 
-    
-}
 
+}
 
 #[cfg(feature = "asynch")]
 quick_error! {
@@ -50,7 +49,7 @@ quick_error! {
             display("io error: {}", err)
         }
 
-        
+
         Pool(err: tokio_threadpool::BlockingError) {
             from()
             cause(err)
