@@ -3,16 +3,16 @@ use super::Options;
 use bit_vec::BitVec;
 use ego_tree::iter::Descendants;
 use ego_tree::{NodeMut, NodeRef, Tree};
+use std::collections::BinaryHeap;
 use std::fs;
 use std::io;
 use std::iter::{FromIterator, IntoIterator, Iterator, Skip};
 use std::path::{Path, PathBuf};
-use std::collections::BinaryHeap;
 use std::time::SystemTime;
 
 pub struct DirTree {
     tree: Tree<DirEntry>,
-    recent: Option<Vec<DirEntryTimed>>
+    recent: Option<Vec<DirEntryTimed>>,
 }
 
 #[derive(Debug)]
@@ -180,7 +180,7 @@ impl<'a> SearchResult<'a> {
             matched.into_iter().for_each(|i| matched_terms.set(i, true));
             self.new_matched_terms = Some(matched_terms);
         } else {
-            self.new_matched_terms  = None;
+            self.new_matched_terms = None;
         }
         res
     }
@@ -201,10 +201,9 @@ impl DirTree {
 
     pub fn new_with_options<P: AsRef<Path>>(root_dir: P, opts: Options) -> Result<Self, io::Error> {
         let p: &Path = root_dir.as_ref();
-        let root_name = p.to_str().ok_or_else(|| io::Error::new(
-            io::ErrorKind::Other,
-            "root directory is not utf8",
-        ))?;
+        let root_name = p
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "root directory is not utf8"))?;
         if !p.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -212,7 +211,7 @@ impl DirTree {
             ));
         }
         let mut cached = Tree::new(DirEntry::new(root_name));
-        let mut recents = if opts.recent_list_size>0 {
+        let mut recents = if opts.recent_list_size > 0 {
             Some(BinaryHeap::with_capacity(opts.recent_list_size))
         } else {
             None
@@ -226,7 +225,7 @@ impl DirTree {
                 root_dir: &Path,
                 path: P,
                 opts: &Options,
-                mut recents: Option<&mut BinaryHeap<DirEntryTimed>>
+                mut recents: Option<&mut BinaryHeap<DirEntryTimed>>,
             ) -> Result<(), io::Error> {
                 for e in fs::read_dir(path)? {
                     let e = e?;
@@ -237,22 +236,23 @@ impl DirTree {
                             match recents.take() {
                                 Some(r) => {
                                     if let Ok(meta) = p.metadata() {
-                                    if let Ok(changed) = meta.modified() {
-                                        if r.len() >= opts.recent_list_size {
-                                            r.pop();
+                                        if let Ok(changed) = meta.modified() {
+                                            if r.len() >= opts.recent_list_size {
+                                                r.pop();
+                                            }
+                                            r.push(DirEntryTimed {
+                                                path: p.strip_prefix(root_dir).unwrap().to_owned(),
+                                                created: changed,
+                                            })
                                         }
-                                        r.push(DirEntryTimed { path: p.strip_prefix(root_dir).unwrap().to_owned(), created:changed })
-                                    }
                                     }
                                     add_entries(&mut dir_node, root_dir, &p, opts, Some(r))?;
                                     recents = Some(r);
-
                                 }
                                 None => {
                                     add_entries(&mut dir_node, root_dir, &p, opts, None)?;
                                 }
                             }
-                            
                         } else if opts.include_files && file_type.is_file() {
                             node.append(e.file_name().to_string_lossy().into());
                         }
@@ -264,7 +264,10 @@ impl DirTree {
             add_entries(&mut root, p, p, &opts, recents.as_mut())?;
         }
 
-        Ok(DirTree { tree: cached, recent: recents.map(BinaryHeap::into_sorted_vec) })
+        Ok(DirTree {
+            tree: cached,
+            recent: recents.map(BinaryHeap::into_sorted_vec),
+        })
     }
 
     pub fn iter(&self) -> Skip<Descendants<DirEntry>> {
@@ -287,8 +290,10 @@ impl DirTree {
         }
     }
 
-    pub fn recent(&self) -> Option<impl Iterator<Item=&Path>> {
-        self.recent.as_ref().map(|v| v.iter().map(|e| e.path.as_ref()))
+    pub fn recent(&self) -> Option<impl Iterator<Item = &Path>> {
+        self.recent
+            .as_ref()
+            .map(|v| v.iter().map(|e| e.path.as_ref()))
     }
 }
 
@@ -360,17 +365,15 @@ mod tests {
         let recents: Vec<_> = c.recent().unwrap().collect();
         println!("Recents {:?}", recents);
         assert_eq!(9, recents.len());
-        
     }
 
-    
     #[test]
     fn test_search_symlinks() {
         env_logger::init();
-        #[cfg(not(feature="symlinks"))]
-        const NUM:usize = 0;
-        #[cfg(feature="symlinks")]
-        const NUM:usize = 1;
+        #[cfg(not(feature = "symlinks"))]
+        const NUM: usize = 0;
+        #[cfg(feature = "symlinks")]
+        const NUM: usize = 1;
         let opts = OptionsBuilder::default()
             .follow_symlinks(true)
             .build()
