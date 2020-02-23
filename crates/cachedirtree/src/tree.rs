@@ -156,31 +156,32 @@ impl<'a> Iterator for SearchResult<'a> {
 
 impl<'a> SearchResult<'a> {
     fn has_match(&mut self) -> bool {
-        let mut matched = vec![];
-        let mut res = true;
         let mut matched_terms = self.matched_terms_stack.last().unwrap().clone();
-        self.search_terms.iter().enumerate().for_each(|(i, term)| {
-            if !matched_terms[i] {
-                let contains = self.current_node.value().search_tag.contains(term);
-                if contains {
-                    matched.push(i)
+        let res = self
+            .search_terms
+            .iter()
+            .enumerate()
+            .filter_map(|(i, term)| {
+                if !matched_terms[i] {
+                    if self.current_node.value().search_tag.contains(term) {
+                        matched_terms.set(i, true);
+                        None
+                    } else {
+                        Some(term) // pasing on only unmatched terms
+                    }
+                } else {
+                    None
                 }
-                res &= contains
-            }
-        });
+            })
+            .count()==0;
         trace!(
-            "Match  for terms {:?}, prev.matches {:?}, new matches {:?} res {:?}",
+            "Match {} for terms {:?},  new matches {:?} res {:?}",
+            self.current_node.value().search_tag,
             self.search_terms,
             matched_terms,
-            matched,
             res
         );
-        if !res && !matched.is_empty() {
-            matched.into_iter().for_each(|i| matched_terms.set(i, true));
-            self.new_matched_terms = Some(matched_terms);
-        } else {
-            self.new_matched_terms = None;
-        }
+        self.new_matched_terms = if !res { Some(matched_terms) } else { None };
         res
     }
 }
