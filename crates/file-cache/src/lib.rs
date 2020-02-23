@@ -7,7 +7,7 @@ extern crate quick_error;
 extern crate log;
 extern crate byteorder;
 #[cfg(feature = "asynch")]
-use self::asynch::{CacheFileRead, CacheFileRead2, CacheFileWrite, SaveIndex};
+use self::asynch::{get_asynch_file, get_asynch_file2, save_index_asynch, Finisher, get_asynch_writable};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use data_encoding::BASE64URL_NOPAD;
 use linked_hash_map::LinkedHashMap;
@@ -32,10 +32,11 @@ const MAX_KEY_SIZE: usize = 4096;
 const FILE_KEY_LEN: usize = 32;
 
 pub type Result<T> = std::result::Result<T, Error>;
+pub(crate) type CacheInnerType = Arc<RwLock<CacheInner>>;
 
 #[derive(Clone)]
 pub struct Cache {
-    inner: Arc<RwLock<CacheInner>>,
+    inner: CacheInnerType,
 }
 
 impl Cache {
@@ -57,25 +58,25 @@ impl Cache {
     }
 
     #[cfg(feature = "asynch")]
-    pub fn add_async<S: AsRef<str>>(&self, key: S) -> CacheFileWrite {
+    pub async fn add_async<S: AsRef<str>>(&self, key: S) -> Result<(tokio::fs::File, Finisher)> {
         let key: String = key.as_ref().into();
-        CacheFileWrite::new(self.inner.clone(), key)
+        get_asynch_writable(key, self.inner.clone()).await
     }
 
     #[cfg(feature = "asynch")]
-    pub fn get_async<S>(&self, key: S) -> CacheFileRead<S>
+    pub async fn get_async<S>(&self, key: S) -> Result<Option<tokio::fs::File>>
     where
         S: AsRef<str>,
     {
-        CacheFileRead::new(self.inner.clone(), key)
+        get_asynch_file(key.as_ref().to_string(), self.inner.clone()).await
     }
 
     #[cfg(feature = "asynch")]
-    pub fn get_async2<S>(&self, key: S) -> CacheFileRead2<S>
+    pub async fn get_async2<S>(&self, key: S) -> Result<Option<(tokio::fs::File, std::path::PathBuf)>>
     where
         S: AsRef<str>,
     {
-        CacheFileRead2::new(self.inner.clone(), key)
+        get_asynch_file2(key.as_ref().to_string(), self.inner.clone()).await
     }
 
     pub fn get<S: AsRef<str>>(&self, key: S) -> Option<Result<fs::File>> {
@@ -89,10 +90,8 @@ impl Cache {
     }
 
     #[cfg(feature = "asynch")]
-    pub fn save_index_async(&self) -> SaveIndex {
-        SaveIndex {
-            cache: self.inner.clone(),
-        }
+    pub async fn save_index_async(&self) -> Result<()> {
+        save_index_asynch(self.inner.clone()).await
     }
 
     pub fn len(&self) -> u64 {
