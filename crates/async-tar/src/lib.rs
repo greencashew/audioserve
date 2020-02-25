@@ -1,13 +1,15 @@
 extern crate tar;
 extern crate tokio;
 
-use futures::future::{Future, FutureExt, TryFutureExt};
+use futures::future::{Future, TryFutureExt};
 use futures::stream::{Stream, StreamExt, TryStreamExt};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::iter::IntoIterator;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs as tokio_fs;
 use tokio::prelude::*;
@@ -40,12 +42,12 @@ enum TarState {
         path: PathBuf,
     },
     OpeningFile {
-        file: Box<dyn Future<Output = tokio_fs::File>>,
+        file: Pin<Box<dyn Future<Output = Result<tokio_fs::File, io::Error>>>>,
         fname: OsString,
     },
     PrepareHeader {
         fname: OsString,
-        meta: Box<dyn Future<Output = fs::Metadata>>,
+        meta: Pin<Box<dyn Future<Output = (Result<fs::Metadata, io::Error>, tokio_fs::File)>>>,
     },
     HeaderReady {
         file: tokio_fs::File,
@@ -169,138 +171,148 @@ impl<P> TarStream<P> {
     }
 }
 
-// impl<P: AsRef<Path> + Send> Stream for TarStream<P> {
-//     type Item = Vec<u8>;
-//     type Error = io::Error;
-//     fn poll(&mut self) -> Result<Async<Option<Self::Item>>, Self::Error> {
-//         loop {
-//             match self.state.take() {
-//                 None => break,
-//                 Some(state) => {
-//                     match state {
-//                         // move to next file
-//                         TarState::BeforeNext => match self.iter.next() {
-//                             None => {
-//                                 self.state = Some(TarState::Finish { block: 0 });
-//                             }
-//                             Some(path) => {
-//                                 self.state = Some(TarState::NextFile {
-//                                     path: path.as_ref().to_owned(),
-//                                 });
-//                             }
-//                         },
-//                         // we start with async opening of file
-//                         TarState::NextFile { path } => {
-//                             let fname = path
-//                                 .file_name()
-//                                 .map(|name| cut_path(name, PATH_MAX_LEN))
-//                                 .unwrap();
-//                             let file = tokio_fs::File::open(self.full_path(path));
-//                             self.state = Some(TarState::OpeningFile { file, fname });
-//                         }
+impl<P: AsRef<Path> + Send> Stream for TarStream<P> {
+    type Item = Result<Vec<u8>, io::Error>;
+    fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
+        loop {
+            match self.state.take() {
+                None => break,
+                Some(state) => {
+                    match state {
+                        // move to next file
+                        TarState::BeforeNext => match self.iter.next() {
+                            None => {
+                                self.state = Some(TarState::Finish { block: 0 });
+                            }
+                            Some(path) => {
+                                self.state = Some(TarState::NextFile {
+                                    path: path.as_ref().to_owned(),
+                                });
+                            }
+                        },
+                        // we start with async opening of file
+                        TarState::NextFile { path } => {
+                            let fname = path
+                                .file_name()
+                                .map(|name| cut_path(name, PATH_MAX_LEN))
+                                .unwrap();
+                            let file = tokio_fs::File::open(self.full_path(path));
+                            self.state = Some(TarState::OpeningFile {
+                                file: Box::pin(file),
+                                fname,
+                            });
+                        }
 
-//                         // now test if file is opened
-//                         TarState::OpeningFile { mut file, fname } => match file.poll() {
-//                             Ok(Async::NotReady) => {
-//                                 self.state = Some(TarState::OpeningFile { file, fname });
-//                                 return Ok(Async::NotReady);
-//                             }
-//                             Ok(Async::Ready(file)) => {
-//                                 let meta = file.metadata();
-//                                 self.state = Some(TarState::PrepareHeader { fname, meta })
-//                             }
+                        // now test if file is opened
+                        TarState::OpeningFile { file: mut file_fut, fname } => {
+                            
+                            match file_fut.as_mut().poll(ctx) {
+                                Poll::Pending => {
+                                    self.state = Some(TarState::OpeningFile { file: file_fut, fname });
+                                    return Poll::Pending;
+                                }
+                                Poll::Ready(Ok(file)) => {
+                                    let meta = async move { let meta = file.metadata().await; (meta, file) };
+                                    self.state = Some(TarState::PrepareHeader { fname, meta:Box::pin(meta) });
+                                }
 
-//                             Err(e) => return Err(e),
-//                         },
+                                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                            }
+                        }
 
-//                         //when file is opened read its metadata
-//                         TarState::PrepareHeader { fname, mut meta } => match meta.poll() {
-//                             Ok(Async::NotReady) => {
-//                                 self.state = Some(TarState::PrepareHeader { fname, meta });
-//                                 return Ok(Async::NotReady);
-//                             }
+                        //when file is opened read its metadata
+                        TarState::PrepareHeader { fname, mut meta } => match meta.as_mut().poll(ctx) {
+                            Poll::Pending => {
+                                self.state = Some(TarState::PrepareHeader { fname, meta });
+                                return Poll::Pending;
+                            }
 
-//                             Ok(Async::Ready((file, meta))) => {
-//                                 self.state = Some(TarState::HeaderReady { file, fname, meta });
-//                             }
+                            Poll::Ready((Ok(meta), file)) => {
+                                self.state = Some(TarState::HeaderReady { file, fname, meta });
+                            }
 
-//                             Err(e) => return Err(e),
-//                         },
+                            Poll::Ready((Err(e), _)) => return Poll::Ready(Some(Err(e))),
+                        },
 
-//                         // from metadata create tar header
-//                         TarState::HeaderReady { file, fname, meta } => {
-//                             let now = SystemTime::now()
-//                                 .duration_since(UNIX_EPOCH)
-//                                 .unwrap()
-//                                 .as_secs();
-//                             let mut header = tar::Header::new_gnu();
-//                             header.set_path(fname).expect("cannot set path in header");
-//                             header.set_size(meta.len());
-//                             header.set_mode(0o644);
-//                             header.set_mtime(now);
-//                             header.set_cksum();
-//                             let bytes = header.as_bytes();
-//                             let chunk = bytes.to_vec();
-//                             self.state = Some(TarState::Sending { file });
-//                             self.position = 0;
-//                             return Ok(Async::Ready(Some(chunk)));
-//                         }
+                        // from metadata create tar header
+                        TarState::HeaderReady { file, fname, meta } => {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            let mut header = tar::Header::new_gnu();
+                            header.set_path(fname).expect("cannot set path in header");
+                            header.set_size(meta.len());
+                            header.set_mode(0o644);
+                            header.set_mtime(now);
+                            header.set_cksum();
+                            let bytes = header.as_bytes();
+                            let chunk = bytes.to_vec();
+                            self.state = Some(TarState::Sending { file });
+                            self.position = 0;
+                            return Poll::Ready(Some(Ok(chunk)));
+                        },
 
-//                         // and send file data into stream
-//                         TarState::Sending { mut file } => {
-//                             match file.poll_read(&mut self.buf[self.position..]) {
-//                                 Ok(Async::NotReady) => {
-//                                     self.state = Some(TarState::Sending { file });
-//                                     return Ok(Async::NotReady);
-//                                 }
+                    //and send file data into stream
+                    TarState::Sending { mut file } => {
+                        let pos = self.position;
+                        match Pin::new(&mut file).poll_read(ctx, &mut self.buf[pos..]) {
+                            Poll::Pending => {
+                                self.state = Some(TarState::Sending { file });
+                                return Poll::Pending;
+                            }
 
-//                                 Ok(Async::Ready(read)) => {
-//                                     if read == 0 {
-//                                         self.state = Some(TarState::BeforeNext);
-//                                         if self.position > 0 {
-//                                             let rem = self.position % 512;
-//                                             let padding_length =
-//                                                 if rem > 0 { 512 - rem } else { 0 };
-//                                             let new_position = self.position + padding_length;
-//                                             // zeroing padding
-//                                             self.buf[self.position..new_position]
-//                                                 .copy_from_slice(&EMPTY_BLOCK[..padding_length]);
-//                                             return Ok(Async::Ready(Some(
-//                                                 self.buf[..new_position].to_vec(),
-//                                             )));
-//                                         }
-//                                     } else {
-//                                         self.position += read;
-//                                         self.state = Some(TarState::Sending { file });
-//                                         if self.position == self.buf.len() {
-//                                             let chunk = self.buf[..self.position].to_vec();
-//                                             self.position = 0;
-//                                             return Ok(Async::Ready(Some(chunk)));
-//                                         }
-//                                     }
-//                                 }
+                            Poll::Ready(Ok(read)) => {
+                                if read == 0 {
+                                    self.state = Some(TarState::BeforeNext);
+                                    if pos > 0 {
+                                        let rem = pos % 512;
+                                        let padding_length =
+                                            if rem > 0 { 512 - rem } else { 0 };
+                                        let new_position = pos + padding_length;
+                                        // zeroing padding
+                                        self.buf[pos..new_position]
+                                            .copy_from_slice(&EMPTY_BLOCK[..padding_length]);
+                                        return Poll::Ready(Some(
+                                            Ok(self.buf[..new_position].to_vec(),
+                                        )));
+                                    }
+                                } else {
+                                    self.position += read;
+                                    self.state = Some(TarState::Sending { file });
+                                    if self.position == self.buf.len() {
+                                        let chunk = self.buf[..self.position].to_vec();
+                                        self.position = 0;
+                                        return Poll::Ready(Some(Ok(chunk)));
+                                    }
+                                }
+                            }
 
-//                                 Err(e) => return Err(e),
-//                             }
-//                         }
-//                         // tar format requires two empty blocks at the end
-//                         TarState::Finish { block } => {
-//                             if block < 2 {
-//                                 let chunk = EMPTY_BLOCK.to_vec();
-//                                 self.state = Some(TarState::Finish { block: block + 1 });
-//                                 return Ok(Async::Ready(Some(chunk)));
-//                             } else {
-//                                 break;
-//                             }
-//                         }
-//                     }
-//                 }
-//             }
-//         }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                                }
+                            }
 
-//         Ok(Async::Ready(None))
-//     }
-// }
+                
+                    // tar format requires two empty blocks at the end
+                    TarState::Finish { block } => {
+                        if block < 2 {
+                            let chunk = EMPTY_BLOCK.to_vec();
+                            self.state = Some(TarState::Finish { block: block + 1 });
+                            return Poll::Ready(Some(Ok(chunk)));
+                        } else {
+                            break;
+                        }
+                    }
+
+                    //_ => unimplemented!()
+                    }
+                }
+            }
+        }
+
+        Poll::Ready(None)
+    }
+}
 
 // #[cfg(test)]
 // mod tests {
