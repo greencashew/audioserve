@@ -36,18 +36,21 @@ fn cut_path<P: AsRef<OsStr>>(p: P, max_len: usize) -> OsString {
     }
 }
 
+type PinnedFuture<T> =  Pin<Box<dyn Future<Output = T>>>;
+
+#[allow(clippy::large_enum_variant)] // not a problem as there is only one instance of state
 enum TarState {
     BeforeNext,
     NextFile {
         path: PathBuf,
     },
     OpeningFile {
-        file: Pin<Box<dyn Future<Output = Result<tokio_fs::File, io::Error>>>>,
+        file: PinnedFuture<Result<tokio_fs::File, io::Error>>,
         fname: OsString,
     },
     PrepareHeader {
         fname: OsString,
-        meta: Pin<Box<dyn Future<Output = (Result<fs::Metadata, io::Error>, tokio_fs::File)>>>,
+        meta: PinnedFuture<(Result<fs::Metadata, io::Error>, tokio_fs::File)>,
     },
     HeaderReady {
         file: tokio_fs::File,
@@ -204,35 +207,46 @@ impl<P: AsRef<Path> + Send> Stream for TarStream<P> {
                         }
 
                         // now test if file is opened
-                        TarState::OpeningFile { file: mut file_fut, fname } => {
-                            
-                            match file_fut.as_mut().poll(ctx) {
-                                Poll::Pending => {
-                                    self.state = Some(TarState::OpeningFile { file: file_fut, fname });
-                                    return Poll::Pending;
-                                }
-                                Poll::Ready(Ok(file)) => {
-                                    let meta = async move { let meta = file.metadata().await; (meta, file) };
-                                    self.state = Some(TarState::PrepareHeader { fname, meta:Box::pin(meta) });
-                                }
-
-                                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
-                            }
-                        }
-
-                        //when file is opened read its metadata
-                        TarState::PrepareHeader { fname, mut meta } => match meta.as_mut().poll(ctx) {
+                        TarState::OpeningFile {
+                            file: mut file_fut,
+                            fname,
+                        } => match file_fut.as_mut().poll(ctx) {
                             Poll::Pending => {
-                                self.state = Some(TarState::PrepareHeader { fname, meta });
+                                self.state = Some(TarState::OpeningFile {
+                                    file: file_fut,
+                                    fname,
+                                });
                                 return Poll::Pending;
                             }
-
-                            Poll::Ready((Ok(meta), file)) => {
-                                self.state = Some(TarState::HeaderReady { file, fname, meta });
+                            Poll::Ready(Ok(file)) => {
+                                let meta = async move {
+                                    let meta = file.metadata().await;
+                                    (meta, file)
+                                };
+                                self.state = Some(TarState::PrepareHeader {
+                                    fname,
+                                    meta: Box::pin(meta),
+                                });
                             }
 
-                            Poll::Ready((Err(e), _)) => return Poll::Ready(Some(Err(e))),
+                            Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
                         },
+
+                        //when file is opened read its metadata
+                        TarState::PrepareHeader { fname, mut meta } => {
+                            match meta.as_mut().poll(ctx) {
+                                Poll::Pending => {
+                                    self.state = Some(TarState::PrepareHeader { fname, meta });
+                                    return Poll::Pending;
+                                }
+
+                                Poll::Ready((Ok(meta), file)) => {
+                                    self.state = Some(TarState::HeaderReady { file, fname, meta });
+                                }
+
+                                Poll::Ready((Err(e), _)) => return Poll::Ready(Some(Err(e))),
+                            }
+                        }
 
                         // from metadata create tar header
                         TarState::HeaderReady { file, fname, meta } => {
@@ -251,60 +265,57 @@ impl<P: AsRef<Path> + Send> Stream for TarStream<P> {
                             self.state = Some(TarState::Sending { file });
                             self.position = 0;
                             return Poll::Ready(Some(Ok(chunk)));
-                        },
-
-                    //and send file data into stream
-                    TarState::Sending { mut file } => {
-                        let pos = self.position;
-                        match Pin::new(&mut file).poll_read(ctx, &mut self.buf[pos..]) {
-                            Poll::Pending => {
-                                self.state = Some(TarState::Sending { file });
-                                return Poll::Pending;
-                            }
-
-                            Poll::Ready(Ok(read)) => {
-                                if read == 0 {
-                                    self.state = Some(TarState::BeforeNext);
-                                    if pos > 0 {
-                                        let rem = pos % 512;
-                                        let padding_length =
-                                            if rem > 0 { 512 - rem } else { 0 };
-                                        let new_position = pos + padding_length;
-                                        // zeroing padding
-                                        self.buf[pos..new_position]
-                                            .copy_from_slice(&EMPTY_BLOCK[..padding_length]);
-                                        return Poll::Ready(Some(
-                                            Ok(self.buf[..new_position].to_vec(),
-                                        )));
-                                    }
-                                } else {
-                                    self.position += read;
-                                    self.state = Some(TarState::Sending { file });
-                                    if self.position == self.buf.len() {
-                                        let chunk = self.buf[..self.position].to_vec();
-                                        self.position = 0;
-                                        return Poll::Ready(Some(Ok(chunk)));
-                                    }
-                                }
-                            }
-
-                            Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
-                                }
-                            }
-
-                
-                    // tar format requires two empty blocks at the end
-                    TarState::Finish { block } => {
-                        if block < 2 {
-                            let chunk = EMPTY_BLOCK.to_vec();
-                            self.state = Some(TarState::Finish { block: block + 1 });
-                            return Poll::Ready(Some(Ok(chunk)));
-                        } else {
-                            break;
                         }
-                    }
 
-                    //_ => unimplemented!()
+                        //and send file data into stream
+                        TarState::Sending { mut file } => {
+                            let pos = self.position;
+                            match Pin::new(&mut file).poll_read(ctx, &mut self.buf[pos..]) {
+                                Poll::Pending => {
+                                    self.state = Some(TarState::Sending { file });
+                                    return Poll::Pending;
+                                }
+
+                                Poll::Ready(Ok(read)) => {
+                                    if read == 0 {
+                                        self.state = Some(TarState::BeforeNext);
+                                        if pos > 0 {
+                                            let rem = pos % 512;
+                                            let padding_length =
+                                                if rem > 0 { 512 - rem } else { 0 };
+                                            let new_position = pos + padding_length;
+                                            // zeroing padding
+                                            self.buf[pos..new_position]
+                                                .copy_from_slice(&EMPTY_BLOCK[..padding_length]);
+                                            return Poll::Ready(Some(Ok(
+                                                self.buf[..new_position].to_vec()
+                                            )));
+                                        }
+                                    } else {
+                                        self.position += read;
+                                        self.state = Some(TarState::Sending { file });
+                                        if self.position == self.buf.len() {
+                                            let chunk = self.buf[..self.position].to_vec();
+                                            self.position = 0;
+                                            return Poll::Ready(Some(Ok(chunk)));
+                                        }
+                                    }
+                                }
+
+                                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                            }
+                        }
+
+                        // tar format requires two empty blocks at the end
+                        TarState::Finish { block } => {
+                            if block < 2 {
+                                let chunk = EMPTY_BLOCK.to_vec();
+                                self.state = Some(TarState::Finish { block: block + 1 });
+                                return Poll::Ready(Some(Ok(chunk)));
+                            } else {
+                                break;
+                            }
+                        } //_ => unimplemented!()
                     }
                 }
             }
@@ -314,129 +325,131 @@ impl<P: AsRef<Path> + Send> Stream for TarStream<P> {
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use tempfile::tempdir;
-//     use tokio::codec::Decoder;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::sink::SinkExt;
+    use futures::stream::{StreamExt, TryStreamExt};
+    use std::io::Read;
+    use tempfile::tempdir;
+    use tokio::runtime::Runtime;
+    use tokio_util::codec::Decoder;
 
-//     #[test]
-//     fn test_tar_from_iter() {
-//         let temp_dir = tempdir().unwrap();
-//         let tar_file_name = temp_dir.path().join("test2.tar");
-//         let tar_file_name2 = tar_file_name.clone();
-//         let files = &["README.md", "Cargo.lock", "Cargo.toml"];
-//         let sizes = files.iter().map(|f| Path::new(f).metadata().unwrap().len());
-//         let expected_archive_len = calc_size(sizes);
-//         let tar_stream =
-//             TarStream::tar_iter_rel(files.into_iter(), std::env::current_dir().unwrap());
+    #[test]
+    fn test_tar_from_iter() {
+        let temp_dir = tempdir().unwrap();
+        let tar_file_name = temp_dir.path().join("test2.tar");
+        let tar_file_name2 = tar_file_name.clone();
+        let files = &["README.md", "Cargo.lock", "Cargo.toml"];
+        let sizes = files.iter().map(|f| Path::new(f).metadata().unwrap().len());
+        let expected_archive_len = calc_size(sizes);
+        let tar_stream =
+            TarStream::tar_iter_rel(files.into_iter(), std::env::current_dir().unwrap());
 
-//         {
-//             let tar_file = tokio_fs::File::create(tar_file_name);
-//             let f = tar_file
-//                 .and_then(|f| {
-//                     let codec = tokio::codec::BytesCodec::new();
-//                     let file_sink = codec.framed(f);
-//                     file_sink.send_all(tar_stream.map(|v| v.into()))
-//                 })
-//                 .map(|_r| ())
-//                 .map_err(|e| eprintln!("Error during tar creation: {}", e));
+        {
+            let tar_file = tokio_fs::File::create(tar_file_name);
+            let f = tar_file
+                .and_then(|f| async move {
+                    let codec = tokio_util::codec::BytesCodec::new();
+                    let mut file_sink = codec.framed(f);
+                    file_sink
+                        .send_all(&mut tar_stream.map(|v| v.map(|x| x.into())))
+                        .await
+                })
+                .map_ok(|_r| ())
+                .map_err(|e| eprintln!("Error during tar creation: {}", e));
 
-//             tokio::run(f);
-//         }
-//         let archive_len = tar_file_name2.metadata().unwrap().len();
-//         assert_eq!(
-//             archive_len, expected_archive_len,
-//             "archive size is as expected"
-//         );
-//         check_archive(tar_file_name2, 3);
-//         temp_dir.close().unwrap();
-//     }
+            let mut rt = Runtime::new().unwrap();
+            rt.block_on(f).unwrap();
+        }
+        let archive_len = tar_file_name2.metadata().unwrap().len();
+        assert_eq!(
+            archive_len, expected_archive_len,
+            "archive size is as expected"
+        );
+        check_archive(tar_file_name2, 3);
+        temp_dir.close().unwrap();
+    }
 
-//     #[test]
-//     fn test_create_tar() {
-//         let tar = TarStream::tar_dir(".");
-//         let temp_dir = tempdir().unwrap();
-//         let tar_file_name = temp_dir.path().join("test.tar");
-//         //let tar_file_name = Path::new("/tmp/test.tar");
-//         let tar_file_name2 = tar_file_name.clone();
+    #[test]
+    fn test_create_tar() {
+        let temp_dir = tempdir().unwrap();
+        let tar_file_name = temp_dir.path().join("test.tar");
+        //let tar_file_name = Path::new("/tmp/test.tar");
+        let tar_file_name2 = tar_file_name.clone();
 
-//         // create tar file asychronously
-//         {
-//             let tar_file = tokio_fs::File::create(tar_file_name);
-//             let f = tar
-//                 .and_then(move |tar_stream| {
-//                     tar_file.and_then(|f| {
-//                         let codec = tokio::codec::BytesCodec::new();
-//                         let file_sink = codec.framed(f);
-//                         file_sink.send_all(tar_stream.map(|v| v.into()))
-//                     })
-//                 })
-//                 .map(|_r| ())
-//                 .map_err(|e| eprintln!("Error during tar creation: {}", e));
+        // create tar file asynchronously
+        // here rewritten to async await - much easier and nicer
+        let f = async move {
+            let tar = TarStream::tar_dir(".").await?;
+            let tar_file = tokio_fs::File::create(tar_file_name).await?;
+            let codec = tokio_util::codec::BytesCodec::new();
+            let mut file_sink = codec.framed(tar_file);
+            file_sink.send_all(&mut tar.map_ok(|v| v.into())).await
+        };
 
-//             tokio::run(f);
-//         }
+        let mut rt = Runtime::new().unwrap();
+        rt.block_on(f).unwrap();
 
-//         check_archive(tar_file_name2, 3);
-//         temp_dir.close().unwrap();
-//     }
+        check_archive(tar_file_name2, 3);
+        temp_dir.close().unwrap();
+    }
 
-//     fn check_archive(p: PathBuf, num_files: usize) {
-//         let mut ar = tar::Archive::new(fs::File::open(p).unwrap());
+    fn check_archive(p: PathBuf, num_files: usize) {
+        let mut ar = tar::Archive::new(fs::File::open(p).unwrap());
 
-//         let entries = ar.entries().unwrap();
-//         let mut count = 0;
-//         for entry in entries {
-//             let mut entry = entry.unwrap();
-//             let p = entry.path().unwrap().into_owned();
+        let entries = ar.entries().unwrap();
+        let mut count = 0;
+        for entry in entries {
+            let mut entry = entry.unwrap();
+            let p = entry.path().unwrap().into_owned();
 
-//             let mut data_from_archive = vec![];
-//             let mut data_from_file = vec![];
-//             entry.read_to_end(&mut data_from_archive).unwrap();
-//             {
-//                 let mut f = fs::File::open(&p).unwrap();
-//                 f.read_to_end(&mut data_from_file).unwrap();
-//             }
+            let mut data_from_archive = vec![];
+            let mut data_from_file = vec![];
+            entry.read_to_end(&mut data_from_archive).unwrap();
+            {
+                let mut f = fs::File::open(&p).unwrap();
+                f.read_to_end(&mut data_from_file).unwrap();
+            }
 
-//             println!(
-//                 "File {:?} entry header start {}, file start {}",
-//                 p,
-//                 entry.raw_header_position(),
-//                 entry.raw_file_position()
-//             );
-//             println!(
-//                 "File {:?} archive len {}, file len {}",
-//                 p,
-//                 data_from_archive.len(),
-//                 data_from_file.len()
-//             );
+            println!(
+                "File {:?} entry header start {}, file start {}",
+                p,
+                entry.raw_header_position(),
+                entry.raw_file_position()
+            );
+            println!(
+                "File {:?} archive len {}, file len {}",
+                p,
+                data_from_archive.len(),
+                data_from_file.len()
+            );
 
-//             assert_eq!(
-//                 data_from_archive.len(),
-//                 data_from_file.len(),
-//                 "File len {:?}",
-//                 p
-//             );
+            assert_eq!(
+                data_from_archive.len(),
+                data_from_file.len(),
+                "File len {:?}",
+                p
+            );
 
-//             count += 1;
-//         }
+            count += 1;
+        }
 
-//         assert_eq!(num_files, count, "There are {} files in archive", num_files);
-//     }
+        assert_eq!(num_files, count, "There are {} files in archive", num_files);
+    }
 
-//     #[test]
-//     fn test_cut_path() {
-//         let a = "abcdef";
-//         let x = cut_path(a, 10);
-//         assert_eq!(a, x.to_str().unwrap(), "under limit");
+    #[test]
+    fn test_cut_path() {
+        let a = "abcdef";
+        let x = cut_path(a, 10);
+        assert_eq!(a, x.to_str().unwrap(), "under limit");
 
-//         let a = "0123456789abcd";
-//         let x = cut_path(a, 10);
-//         assert_eq!("0123456789", x.to_str().unwrap(), "over limit, no ext");
+        let a = "0123456789abcd";
+        let x = cut_path(a, 10);
+        assert_eq!("0123456789", x.to_str().unwrap(), "over limit, no ext");
 
-//         let a = "0123456789abcd.mp3";
-//         let x = cut_path(a, 10);
-//         assert_eq!("012345.mp3", x.to_str().unwrap(), "over limit, no ext");
-//     }
-// }
+        let a = "0123456789abcd.mp3";
+        let x = cut_path(a, 10);
+        assert_eq!("012345.mp3", x.to_str().unwrap(), "over limit, no ext");
+    }
+}
