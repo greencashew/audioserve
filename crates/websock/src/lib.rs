@@ -12,6 +12,7 @@ use std::fmt;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::sync::{Arc, RwLock};
 use tokio;
 use tokio_tungstenite::{
     tungstenite::{self, protocol},
@@ -66,13 +67,14 @@ where
             let ws_process = ws_future.and_then(move |ws| {
                 let (tx, rc) = ws.split();
                 rc.and_then(move |m| match m.inner {
-                    protocol::Message::Ping(p) => {
+                    protocol::Message::Ping(p) => { // Send Pong for Ping
                         debug!("Got ping {:?}", p);
                         Box::new(future::ok(Some(Message {
                             inner: protocol::Message::Pong(p),
                             context: m.context,
                         })))
                     }
+                    protocol::Message::Close(_)=> Box::new(future::ok(None)), // No response for Close message
                     _ => f(m),
                 })
                 .try_filter_map(|m| async { Ok(m) })
@@ -156,7 +158,6 @@ pub fn upgrade_connection<T: Default>(
     Ok((res, upgraded))
 }
 
-use std::sync::{Arc, RwLock};
 
 /// A websocket `Stream` and `Sink`
 /// This struct can hold a context for this particular connection

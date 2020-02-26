@@ -7,7 +7,7 @@ edition = "2018"
 [dependencies]
 
 hyper = "0.13"
-tokio = {version="0.2", features=["rt-threaded", "macros"]}
+tokio = {version="0.2", features=["rt-threaded", "macros", "io-util", "fs"]}
 futures = "0.3"
 log = "0.4"
 tokio-tungstenite = "0.10"
