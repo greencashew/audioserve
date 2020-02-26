@@ -1,19 +1,22 @@
 #[macro_use]
 extern crate log;
 
-use futures::future::{self, poll_fn};
+use futures::future;
 use futures::prelude::*;
 use futures::ready;
 use headers::{self, HeaderMapExt};
 use hyper::header::{self, AsHeaderName, HeaderMap, HeaderValue};
-use hyper::rt;
 use hyper::{Body, Request, Response, StatusCode};
 use quick_error::quick_error;
 use std::fmt;
 use std::io;
-use tokio_tungstenite::{tungstenite::{protocol, self}, WebSocketStream};
 use std::pin::Pin;
-use std::task::{Poll, Context};
+use std::task::{Context, Poll};
+use tokio;
+use tokio_tungstenite::{
+    tungstenite::{self, protocol},
+    WebSocketStream,
+};
 
 quick_error! {
     #[derive(Debug)]
@@ -39,53 +42,55 @@ fn header_matches<S: AsHeaderName>(headers: &HeaderMap<HeaderValue>, name: S, va
         .unwrap_or(false)
 }
 
-/// This is a high level function that spawn a websocket handler from 
+/// This is a high level function that spawn a websocket handler from
 /// appropriate HTTP request (e.g. websocket upgrade request).
 /// Each incomming message can be then processed with function f,
 /// which returns future with optional response to this message.
-/// This function returns immediate HTPP response, which is either of status
-/// 101 Protocol upgrade, if websocket handshake is OK, or of status 400, if 
+/// This function returns immediate HTTP response, which is either of status
+/// 101 Protocol upgrade, if websocket handshake is OK, or of status 400, if
 /// handshake was no successful.
-/// 
+///
 /// All messages in this websocket share (guarded by RwLock) context of type T
 pub fn spawn_websocket<T, F>(req: Request<Body>, mut f: F) -> Response<Body>
 where
     T: Default + Send + Sync + 'static,
-    F: FnMut(Message<T>) -> Box<dyn Future<Output = Result<Option<Message<T>>, Error> > + Send + Unpin>
+    F: FnMut(
+            Message<T>,
+        ) -> Box<dyn Future<Output = Result<Option<Message<T>>, Error>> + Send + Unpin>
         + Send
         + 'static,
 {
     match upgrade_connection::<T>(req) {
         Err(r) => r,
         Ok((r, ws_future)) => {
-            let ws_process = ws_future
-                .and_then(move |ws| {
-                    let (tx, rc) = ws.split();
-                    rc.and_then(move |m| match m.inner {
-                        protocol::Message::Ping(p) => {
-                            debug!("Got ping {:?}",p);
-                            Box::new(future::ok(Some(Message {
+            let ws_process = ws_future.and_then(move |ws| {
+                let (tx, rc) = ws.split();
+                rc.and_then(move |m| match m.inner {
+                    protocol::Message::Ping(p) => {
+                        debug!("Got ping {:?}", p);
+                        Box::new(future::ok(Some(Message {
                             inner: protocol::Message::Pong(p),
                             context: m.context,
-                        })))},
-                        _ => f(m),
-                    })
-                    .filter_map(|m| m)
-                    .forward(tx)
-                    .map(|_| debug!("Websocket has ended"))
-                    .map_err(|err| error!("Socket error {}", err))
-                });
-            rt::spawn(ws_process);
+                        })))
+                    }
+                    _ => f(m),
+                })
+                .try_filter_map(|m| async { Ok(m) })
+                .forward(tx)
+                .map_ok(|_| debug!("Websocket has ended"))
+                .map_err(|err| error!("Socket error {}", err))
+            });
+            tokio::spawn(ws_process);
             r
         }
     }
 }
 
-/// This function does basic websocket handshake, 
+/// This function does basic websocket handshake,
 /// return tuple of successful HTTP response (with status 101 - Protocol Upgrade) and
-/// future resolving to Websocket( struct implementing Stream and Sink of messages) or 
-/// error response (status 400) oif websocket handshake was not successful
-/// 
+/// future resolving to Websocket( struct implementing Stream and Sink of messages) or
+/// error response (status 400) if websocket handshake was not successful
+///
 /// Websocket can have context of type T, which is then shared (guarded by RwLock) with all
 /// messages in this websocket.
 pub fn upgrade_connection<T: Default>(
@@ -138,14 +143,15 @@ pub fn upgrade_connection<T: Default>(
     h.typed_insert(headers::Upgrade::websocket());
     h.typed_insert(headers::SecWebsocketAccept::from(key.unwrap()));
     h.typed_insert(headers::Connection::upgrade());
-    let upgraded = req.into_body().on_upgrade()
-    .map_err(|err| error!("Cannot create websocket: {} ", err))
-    .and_then(|upgraded| {
-        debug!("Connection upgraded to websocket");
-        let r = WebSocket::new(upgraded);
-        r
-    })
-    ;
+    let upgraded = req
+        .into_body()
+        .on_upgrade()
+        .map_err(|err| error!("Cannot create websocket: {} ", err))
+        .and_then(|upgraded| async {
+            debug!("Connection upgraded to websocket");
+            let r = WebSocket::new(upgraded).await;
+            Ok(r)
+        });
 
     Ok((res, upgraded))
 }
@@ -160,7 +166,6 @@ pub struct WebSocket<T> {
 }
 
 impl<T: Default> WebSocket<T> {
-
     /// Creates new WebSocket from an upgraded connection with default context
     pub(crate) async fn new(upgraded: hyper::upgrade::Upgraded) -> Self {
         let inner = WebSocketStream::from_raw_socket(upgraded, protocol::Role::Server, None).await;
@@ -171,8 +176,7 @@ impl<T: Default> WebSocket<T> {
     }
 }
 
-impl <T> WebSocket<T> {
-
+impl<T> WebSocket<T> {
     /// Creates new WebSocket from an upgraded connection with default context
     #[allow(dead_code)]
     pub(crate) async fn new_with_context(upgraded: hyper::upgrade::Upgraded, context: T) -> Self {
@@ -182,20 +186,17 @@ impl <T> WebSocket<T> {
             context: Arc::new(RwLock::new(context)),
         }
     }
-
-    /// Gracefully close this websocket.
-    pub async fn close(mut self) -> Result<(),Error> {
-        unimplemented!()
-        //poll_fn(move || Sink::close(&mut self))
-    }
 }
 
-impl <T> Stream for WebSocket<T> {
+impl<T> Stream for WebSocket<T> {
     type Item = Result<Message<T>, crate::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
-            Some(Ok(item)) => Poll::Ready(Some(Ok(Message { inner: item, context: self.context.clone() }))),
+            Some(Ok(item)) => Poll::Ready(Some(Ok(Message {
+                inner: item,
+                context: self.context.clone(),
+            }))),
             Some(Err(e)) => {
                 log::debug!("websocket poll error: {}", e);
                 Poll::Ready(Some(Err(crate::Error::Ws(e))))
@@ -208,7 +209,7 @@ impl <T> Stream for WebSocket<T> {
     }
 }
 
-impl <T> Sink<Message<T>> for WebSocket<T> {
+impl<T> Sink<Message<T>> for WebSocket<T> {
     type Error = crate::Error;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -245,8 +246,6 @@ impl <T> Sink<Message<T>> for WebSocket<T> {
         }
     }
 }
-
-
 
 impl<T> fmt::Debug for WebSocket<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
