@@ -4,15 +4,15 @@ use super::types::AudioFormat;
 use crate::config::get_config;
 use crate::error::Error;
 use futures::future::Either;
-use futures::Future;
+use futures::prelude::*;
 use mime::Mime;
 use std::ffi::OsStr;
 use std::fmt::Debug;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use tokio::timer::Delay;
-use tokio_process::{ChildStdout, CommandExt};
+use tokio::time::delay_for;
+use tokio::process::{ChildStdout, Command};
 
 #[cfg(feature = "transcoding-cache")]
 pub mod cache;
@@ -190,9 +190,9 @@ pub struct Transcoder {
 
 #[cfg(feature = "transcoding-cache")]
 type TranscodedStream =
-    Box<dyn futures::Stream<Item = Vec<u8>, Error = std::io::Error> + Send + 'static>;
+    Box<dyn futures::Stream<Item = Result<Vec<u8>,std::io::Error>> + Send + 'static>;
 #[cfg(feature = "transcoding-cache")]
-type TranscodedFuture = Box<dyn Future<Item = TranscodedStream, Error = Error> + Send>;
+type TranscodedFuture = Box<dyn Future<Output = Result<TranscodedStream, Error>> + Send>;
 
 impl Transcoder {
     pub fn new(quality: TranscodingFormat) -> Self {
@@ -323,7 +323,7 @@ impl Transcoder {
     ) -> TranscodedFuture {
         use self::cache::{cache_key, get_cache};
         use futures::future;
-        use futures::sync::mpsc;
+        use futures::channel::mpsc;
         use futures::{Sink, Stream};
         use std::io;
 
@@ -334,7 +334,7 @@ impl Transcoder {
         };
         if is_transcoded || seek.is_some() || get_config().transcoding.cache.disabled {
             debug!("Shoud not add to cache as is already transcoded, seeking or cache is disabled");
-            return Box::new(future::result(
+            return Box::new(future::ready(
                 self.transcode_inner(file, seek, span, counter)
                     .map(|(stream, f)| {
                         tokio::spawn(f);
@@ -360,9 +360,9 @@ impl Transcoder {
                 self.transcode_inner(file, seek, span, counter)
                     .map(|(stream, f)| {
                         tokio::spawn(f.then(|res| {
-                            fn box_me<I, E, F: Future<Item = I, Error = E> + 'static + Send>(
+                            fn box_me<I, E, F: Future<Output = Result<I, E>> + 'static + Send>(
                                 f: F,
-                            ) -> Box<Future<Item = I, Error = E> + 'static + Send>
+                            ) -> Box<Future<Output = Result<I, E>> + 'static + Send>
                             {
                                 Box::new(f)
                             };
@@ -396,7 +396,7 @@ impl Transcoder {
                             }
                         }));
                         let cache_sink =
-                            tokio::codec::FramedWrite::new(cache_file, self::vec_codec::VecEncoder);
+                            tokio_util::codec::FramedWrite::new(cache_file, self::vec_codec::VecEncoder);
                         let (tx, rx) = mpsc::channel(64);
                         let tx = cache_sink
                             .fanout(tx.sink_map_err(|e| io::Error::new(io::ErrorKind::Other, e)));
@@ -422,7 +422,7 @@ impl Transcoder {
         seek: Option<f32>,
         span: Option<TimeSpan>,
         counter: super::Counter,
-    ) -> Result<(ChunkStream<ChildStdout>, impl Future<Item = (), Error = ()>), Error> {
+    ) -> Result<(ChunkStream<ChildStdout>, impl Future<Output = Result<(),()>>), Error> {
         let mut cmd = match (&file, &self.quality) {
             (_, TranscodingFormat::Remux) => {
                 self.build_remux_command(file.as_ref(), seek, span, false)
@@ -433,7 +433,7 @@ impl Transcoder {
             _ => self.build_command(file.as_ref(), seek, span),
         };
         let counter2 = counter.clone();
-        match cmd.spawn_async() {
+        match cmd.spawn() {
             Ok(mut child) => {
                 if child.stdout().is_some() {
                     counter.fetch_add(1, Ordering::SeqCst);
@@ -443,10 +443,8 @@ impl Transcoder {
                     let pid = child.id();
                     debug!("waiting for transcode process to end");
                     let fut =
-                        child
-                        .select2(Delay::new(
-                            Instant::now()
-                                + Duration::from_secs(
+                        future::select(child, delay_for(
+                                Duration::from_secs(
                                     u64::from(get_config().transcoding.max_runtime_hours * 3600),
                                 ),
                         ))
@@ -531,7 +529,7 @@ pub fn guess_format<P: AsRef<std::path::Path>>(p: P) -> AudioFormat {
 mod vec_codec {
     use bytes::BufMut;
     use std::io;
-    use tokio::codec::Encoder;
+    use tokio_util::codec::Encoder;
 
     pub struct VecEncoder;
 
@@ -567,7 +565,7 @@ mod tests {
         remove: bool,
         span: Option<TimeSpan>,
     ) {
-        pretty_env_logger::try_init().ok();
+        env_logger::try_init().ok();
         let t = Transcoder::new(TranscodingFormat::default_level(QualityLevel::Low));
         let out_file = temp_dir().join(output_file);
         let mut cmd = match copy_file {

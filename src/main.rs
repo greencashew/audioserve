@@ -8,7 +8,7 @@ extern crate serde_derive;
 extern crate lazy_static;
 
 use config::{get_config, init_config};
-use hyper::rt::Future;
+use futures::prelude::*;
 use hyper::server::conn::AddrIncoming;
 use hyper::Server as HttpServer;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -190,7 +190,7 @@ fn main() {
         }
         Ok(c) => c,
     };
-    pretty_env_logger::init();
+    env_logger::init();
     debug!("Started with following config {:?}", get_config());
 
     media_info::init();

@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_chapters_file() {
-        //pretty_env_logger::init();
+        //env_logger::init();
         let path = Path::new("./test_data/01-file.mp3");
         let chapters = chapters_from_csv(path).unwrap().unwrap();
         assert_eq!(3, chapters.len());
