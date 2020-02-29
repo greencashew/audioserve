@@ -68,7 +68,7 @@ async fn server_upgrade(req: Request<Body>) -> Result<Response<Body>, io::Error>
 }
 #[tokio::main]
 async fn main() -> Result<(), GenericError> {
-    pretty_env_logger::init();
+    env_logger::init();
     let addr = ([127, 0, 0, 1], 5000).into();
     let service = make_service_fn(|_| async { Ok::<_, Infallible>(service_fn(route))});
     let server = Server::bind(&addr).serve(service);
