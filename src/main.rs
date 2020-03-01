@@ -59,7 +59,7 @@ fn gen_my_secret<P: AsRef<Path>>(file: P) -> Result<Vec<u8>, io::Error> {
         let mut random = [0u8; 32];
         let rng = SystemRandom::new();
         rng.fill(&mut random)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, "Error when generating secret"))?;
         let mut f;
         #[cfg(unix)]
         {
@@ -85,7 +85,7 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<std::
     let cfg = get_config();
     let svc = FileSendService {
         authenticator: get_config().shared_secret.as_ref().map(
-            |secret| -> Arc<Box<services::auth::Authenticator<Credentials = ()>>> {
+            |secret| -> Arc<Box<dyn services::auth::Authenticator<Credentials = ()>>> {
                 Arc::new(Box::new(SharedSecretAuthenticator::new(
                     secret.clone(),
                     my_secret,
@@ -102,7 +102,7 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<std::
     let addr = cfg.listen;
     let incomming_connections = AddrIncoming::bind(&addr)?;
 
-    let server: Box<dyn Future<Item = (), Error = hyper::Error> + Send> =
+    let server: Box<dyn Future<Output = Result<(), hyper::Error>> + Send> =
         match get_config().ssl.as_ref() {
             None => {
                 let server = HttpServer::builder(incomming_connections).serve(move || {
@@ -164,8 +164,9 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<std::
     let server = server.map_err(|e| error!("Cannot start HTTP server due to error {}", e));
 
     let mut rt = tokio::runtime::Builder::new()
-        .blocking_threads(cfg.thread_pool.queue_size as usize)
+        .threaded_scheduler()
         .core_threads(cfg.thread_pool.num_threads as usize)
+        .max_threads(cfg.thread_pool.num_threads as usize + cfg.thread_pool.queue_size as usize)
         .keep_alive(cfg.thread_pool.keep_alive)
         .name_prefix("tokio-pool-")
         .build()

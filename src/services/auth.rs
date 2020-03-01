@@ -2,13 +2,12 @@ use super::subs::short_response;
 use crate::error::Error;
 use crate::util::ResponseBuilderExt;
 use data_encoding::BASE64;
-use futures::{future, Future, Stream};
+use futures::{future, prelude::*};
 use headers::authorization::Bearer;
 use headers::{Authorization, ContentLength, ContentType, Cookie, HeaderMapExt};
 use hyper::header::SET_COOKIE;
 use hyper::{Body, Method, Request, Response, StatusCode};
-use ring::digest::{digest, SHA256};
-use ring::hmac;
+use ring::{digest::{digest, SHA256}, hmac};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::borrow;
 use std::collections::HashMap;
@@ -16,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use url::form_urlencoded;
 
 type AuthResult<T> = Result<(Request<Body>, T), Response<Body>>;
-type AuthFuture<T> = Box<Future<Item = AuthResult<T>, Error = Error> + Send>;
+type AuthFuture<T> = Box<dyn Future<Output = Result<AuthResult<T>, Error>> + Send>;
 
 pub trait Authenticator: Send + Sync {
     type Credentials;
@@ -54,10 +53,9 @@ impl Authenticator for SharedSecretAuthenticator {
             debug!("Authentication request");
             let auth = self.clone();
             return Box::new(
-                req.into_body()
-                    .concat2()
+                hyper::body::to_bytes(req.into_body())
                     .map_err(Error::new_with_cause)
-                    .map(move |b| {
+                    .map_ok(move |b| {
                         let params = form_urlencoded::parse(b.as_ref())
                             .into_owned()
                             .collect::<HashMap<String, String>>();
@@ -175,7 +173,7 @@ impl Token {
         let validity: u64 = now() + u64::from(token_validity_hours) * 3600;
         let validity: [u8; 8] = unsafe { ::std::mem::transmute(validity.to_be()) };
         let to_sign = prepare_data(&random, validity);
-        let key = hmac::SigningKey::new(&SHA256, secret);
+        let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
         let sig = hmac::sign(&key, &to_sign);
         let slice = sig.as_ref();
         assert!(slice.len() == 32);
@@ -190,7 +188,7 @@ impl Token {
     }
 
     fn is_valid(&self, secret: &[u8]) -> bool {
-        let key = hmac::VerificationKey::new(&SHA256, secret);
+        let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
         let data = prepare_data(&self.random, self.validity);
         if hmac::verify(&key, &data, &self.signature).is_err() {
             return false;

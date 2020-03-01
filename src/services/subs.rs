@@ -9,9 +9,10 @@ use super::Counter;
 use crate::config::get_config;
 use crate::error::Error;
 use crate::util::{checked_dec, into_range_bounds, to_satisfiable_range, ResponseBuilderExt};
-
-use futures::future::{self, poll_fn, Future};
-use futures::{try_ready, Async, Stream};
+use futures::prelude::*;
+use futures::{future, ready, Stream};
+use std::task::{Poll, Context};
+use std::pin::Pin;
 use headers::{AcceptRanges, CacheControl, ContentLength, ContentRange, ContentType, LastModified};
 #[cfg(feature = "folder-download")]
 use hyper::header::CONTENT_DISPOSITION;
@@ -25,7 +26,7 @@ use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use tokio::io::AsyncRead;
-use tokio_threadpool::blocking;
+use tokio::task::spawn_blocking as blocking;
 
 pub type ByteRenge = (Bound<u64>, Bound<u64>);
 
@@ -34,7 +35,7 @@ const SEVER_ERROR_TRANSCODING: &str = "Server error during transcoding process";
 
 type Response = HyperResponse<Body>;
 
-pub type ResponseFuture = Box<Future<Item = Response, Error = Error> + Send>;
+pub type ResponseFuture = Box<dyn Future<Output = Result<Response, Error>> + Send +Unpin>;
 
 pub fn short_response(status: StatusCode, msg: &'static str) -> Response {
     HyperResponse::builder()
@@ -93,9 +94,9 @@ fn serve_file_cached_or_transcoded(
         .then(|res| match res {
             Err(e) => {
                 error!("Cache lookup error: {}", e);
-                Ok(None)
+                future::ok(None)
             }
-            Ok(f) => Ok(f),
+            Ok(f) => future::ok(f),
         })
         .and_then(move |maybe_file| match maybe_file {
             None => serve_file_transcoded_checked(
@@ -206,29 +207,37 @@ pub struct ChunkStream<T> {
 }
 
 impl<T: AsyncRead> Stream for ChunkStream<T> {
-    type Item = Vec<u8>;
-    type Error = io::Error;
+    type Item = Result<Vec<u8>, io::Error>;
 
-    fn poll(&mut self) -> Result<Async<Option<Self::Item>>, Self::Error> {
+    fn poll_next(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
         if self.src.is_none() {
             error!("Polling after stream is done");
-            return Ok(Async::Ready(None));
+            return Poll::Ready(None);
         }
         if self.remains == 0 {
             self.src.take();
-            return Ok(Async::Ready(None));
+            return Poll::Ready(None);
         }
 
-        let read = try_ready! {self.src.as_mut().unwrap().poll_read(&mut self.buf)};
-        if read == 0 {
-            self.src.take();
-            Ok(Async::Ready(None))
-        } else {
-            let to_send = self.remains.min(read as u64);
-            self.remains -= to_send;
-            let chunk = self.buf[..to_send as usize].to_vec();
-            Ok(Async::Ready(Some(chunk)))
-        }
+        match ready! {
+            {
+                // TODO: resolve unsafe - can we use Unpin
+            let pinned_stream = unsafe {Pin::new_unchecked(&mut self.src.unwrap())};
+            pinned_stream.poll_read(ctx, &mut self.buf)
+            }
+        }{
+            Ok(read) =>
+                if read == 0 {
+                    self.src.take();
+                    Poll::Ready(None)
+                } else {
+                    let to_send = self.remains.min(read as u64);
+                    self.remains -= to_send;
+                    let chunk = self.buf[..to_send as usize].to_vec();
+                    Poll::Ready(Some(Ok(chunk)))
+                }
+            Err(e) => Poll::Ready(Some(Err(e)))
+    }
     }
 }
 
@@ -250,8 +259,8 @@ fn serve_opened_file(
     range: Option<ByteRenge>,
     caching: Option<u32>,
     mime: mime::Mime,
-) -> impl Future<Item = Response, Error = io::Error> {
-    file.metadata().and_then(move |(file, meta)| {
+) -> impl Future<Output = Result<Response, io::Error>> {
+    file.metadata().and_then(move |meta| {
         let file_len = meta.len();
         if file_len == 0 {
             warn!("File has zero size ")
@@ -288,11 +297,11 @@ fn serve_opened_file(
                 (0, checked_dec(file_len))
             }
         };
-        file.seek(SeekFrom::Start(start)).map(move |(file, _pos)| {
+        file.seek(SeekFrom::Start(start)).map(move |_pos| {
             let stream = ChunkStream::new_with_limit(file, end - start + 1);
-            resp.typed_header(ContentLength(end - start + 1))
+            Ok(resp.typed_header(ContentLength(end - start + 1))
                 .body(Body::wrap_stream(stream))
-                .unwrap()
+                .unwrap())
         })
     })
 }
@@ -313,7 +322,7 @@ fn serve_file_from_fs(
             })
             .or_else(move |_| {
                 error!("Error when sending file {:?}", filename3);
-                Ok(short_response(StatusCode::NOT_FOUND, NOT_FOUND_MESSAGE))
+                future::ok(short_response(StatusCode::NOT_FOUND, NOT_FOUND_MESSAGE))
             }),
     )
 }
@@ -371,8 +380,8 @@ pub fn get_folder(
     ordering: FoldersOrdering,
 ) -> ResponseFuture {
     Box::new(
-        poll_fn(move || blocking(|| list_dir(&base_path, &folder_path, ordering)))
-            .map(|res| match res {
+        blocking(|| list_dir(&base_path, &folder_path, ordering))
+            .map_ok(|res| match res {
                 Ok(folder) => json_response(&folder),
                 Err(_) => short_response(StatusCode::NOT_FOUND, NOT_FOUND_MESSAGE),
             })
@@ -403,8 +412,8 @@ pub fn download_folder(base_path: &'static Path, folder_path: PathBuf) -> Respon
                     .map(std::borrow::ToOwned::to_owned)
                     .unwrap_or_else(|| "audio".into());
                 download_name.push_str(".tar");
-                let f = poll_fn(move || blocking(|| list_dir_files_only(&base_path, &folder_path)))
-                    .map(move |res| match res {
+                let f = blocking(|| list_dir_files_only(&base_path, &folder_path))
+                    .map_ok(move |res| match res {
                         Ok(folder) => {
                             let total_len: u64;
                             {
@@ -483,25 +492,23 @@ pub fn search(
     ordering: FoldersOrdering,
 ) -> ResponseFuture {
     Box::new(
-        poll_fn(move || {
-            let query = query.clone();
-            blocking(|| {
+        
+        blocking(|| {
                 let res = searcher.search(collection, query, ordering);
                 json_response(&res)
             })
-        })
         .map_err(Error::new_with_cause),
     )
 }
 
 pub fn recent(collection: usize, searcher: Search<String>) -> ResponseFuture {
     Box::new(
-        poll_fn(move || {
+        
             blocking(|| {
                 let res = searcher.recent(collection);
                 json_response(&res)
             })
-        })
-        .map_err(Error::new_with_cause),
+            .map_err(Error::new_with_cause)
+        
     )
 }

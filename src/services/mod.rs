@@ -8,7 +8,8 @@ use self::transcode::QualityLevel;
 use self::types::FoldersOrdering;
 use crate::config::get_config;
 use crate::util::header2header;
-use futures::{future, Future};
+use futures::prelude::*;
+use futures::{future, TryFutureExt};
 use headers::{
     AccessControlAllowCredentials, AccessControlAllowOrigin, HeaderMapExt, Origin, Range,
 };
@@ -21,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use url::form_urlencoded;
+use std::task::Poll;
 
 pub mod audio_folder;
 pub mod audio_meta;
@@ -49,7 +51,7 @@ pub struct TranscodingDetails {
 
 #[derive(Clone)]
 pub struct FileSendService<T> {
-    pub authenticator: Option<Arc<Box<Authenticator<Credentials = T>>>>,
+    pub authenticator: Option<Arc<Box<dyn Authenticator<Credentials = T>>>>,
     pub search: Search<String>,
     pub transcoding: TranscodingDetails,
 }
@@ -80,12 +82,16 @@ fn add_cors_headers(
     }
 }
 
-impl<C: 'static> Service for FileSendService<C> {
-    type ReqBody = Body;
-    type ResBody = Body;
+impl<C: 'static> Service<Request<Body>> for FileSendService<C> {
+    type Response = Response<Body>;
     type Error = crate::error::Error;
-    type Future = Box<Future<Item = Response<Self::ResBody>, Error = Self::Error> + Send>;
-    fn call(&mut self, req: Request<Self::ReqBody>) -> Self::Future {
+    type Future = Box<dyn Future<Output = Result<Self::Response,  Self::Error>> + Send+Unpin>;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
         //static files
         if req.uri().path() == "/" {
             return send_file_simple(

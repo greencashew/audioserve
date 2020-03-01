@@ -5,6 +5,7 @@ use crate::config::get_config;
 use crate::error::Error;
 use futures::future::Either;
 use futures::prelude::*;
+use futures::stream::{TryStreamExt};
 use mime::Mime;
 use std::ffi::OsStr;
 use std::fmt::Debug;
@@ -303,8 +304,8 @@ impl Transcoder {
         span: Option<TimeSpan>,
         counter: super::Counter,
         _quality: QualityLevel,
-    ) -> impl Future<Item = ChunkStream<ChildStdout>, Error = Error> {
-        futures::future::result(self.transcode_inner(file, seek, span, counter).map(
+    ) -> impl Future<Output = Result<ChunkStream<ChildStdout>, Error>> {
+        future::ready(self.transcode_inner(file, seek, span, counter).map(
             |(stream, f)| {
                 tokio::spawn(f);
                 stream
@@ -322,7 +323,6 @@ impl Transcoder {
         quality: QualityLevel,
     ) -> TranscodedFuture {
         use self::cache::{cache_key, get_cache};
-        use futures::future;
         use futures::channel::mpsc;
         use futures::{Sink, Stream};
         use std::io;
@@ -349,15 +349,15 @@ impl Transcoder {
         let fut = cache.add_async(key).then(move |res| match res {
             Err(e) => {
                 warn!("Cannot create cache entry: {}", e);
-                self.transcode_inner(file, seek, span, counter)
+                future::ready(self.transcode_inner(file, seek, span, counter)
                     .map(|(stream, f)| {
                         tokio::spawn(f);
 
                         Box::new(stream) as TranscodedStream
-                    })
+                    }))
             }
             Ok((cache_file, cache_finish)) => {
-                self.transcode_inner(file, seek, span, counter)
+                future::ready(self.transcode_inner(file, seek, span, counter)
                     .map(|(stream, f)| {
                         tokio::spawn(f.then(|res| {
                             fn box_me<I, E, F: Future<Output = Result<I, E>> + 'static + Send>(
@@ -400,18 +400,20 @@ impl Transcoder {
                         let (tx, rx) = mpsc::channel(64);
                         let tx = cache_sink
                             .fanout(tx.sink_map_err(|e| io::Error::new(io::ErrorKind::Other, e)));
-                        tokio::spawn(tx.send_all(stream).then(|res| {
+                        tokio::spawn(tx.send_all(&mut stream).then(|res| {
                             if let Err(e) = res {
                                 warn!("Error in channel: {}", e)
                             }
-                            Ok(())
+                            future::ok(())
                         }));
-                        Box::new(rx.map_err(|_| {
+                        Box::new(rx
+                            .map_err(|_| {
                             error!("Error in chanel");
                             io::Error::new(io::ErrorKind::Other, "Error in channel")
-                        })) as TranscodedStream
+                        })
+                            ) as TranscodedStream
                     })
-            }
+                )}
         });
         Box::new(fut)
     }
@@ -451,22 +453,34 @@ impl Transcoder {
                         .then(move |res| {
                             counter2.fetch_sub(1, Ordering::SeqCst);
                             match res {
-                                Ok(Either::A((res, _d))) => {
-                                    if res.success() {
-                                        debug!("Finished transcoding process of {:?} normally after {:?}",
-                                    file.as_ref(),
-                                    Instant::now() - start);
-                                    Ok(())
-                                    } else {
-                                        warn!(
-                                            "Transconding of file {:?} failed with code {:?}",
-                                            file.as_ref(),
-                                            res.code()
-                                        );
-                                        Err(())
-                                    }
+                                Either::Left((res, _d)) => {
+                                    match res {
+
+                                        Ok(res) =>
+                                        if res.success() {
+                                            debug!("Finished transcoding process of {:?} normally after {:?}",
+                                        file.as_ref(),
+                                        Instant::now() - start);
+                                        future::ok(())
+                                        } else {
+                                            warn!(
+                                                "Transconding of file {:?} failed with code {:?}",
+                                                file.as_ref(),
+                                                res.code()
+                                            );
+                                            future::err(())
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Error running transcoding process for file {:?} error {}",
+                                                file.as_ref(),
+                                                e
+                                            );
+                                            future::err(())
+                                        }
                                 }
-                                Ok(Either::B((_d, mut child))) => {
+                                }
+                                Either::Right((_d, mut child)) => {
                                     error!(
                                         "Transcoding of file {:?} took longer then deadline",
                                         file.as_ref()
@@ -474,19 +488,7 @@ impl Transcoder {
                                     child.kill().unwrap_or_else(|e| {
                                         error!("Failed to kill process pid {} error {}", pid, e)
                                     });
-                                    Err(())
-                                }
-                                Err(Either::A((e, _))) => {
-                                    error!(
-                                        "Error running transcoding process for file {:?} error {}",
-                                        file.as_ref(),
-                                        e
-                                    );
-                                    Err(())
-                                }
-                                Err(Either::B((e, _))) => {
-                                    error!("Timer error on process pid {} error {}", pid, e);
-                                    Err(())
+                                    future::err(())
                                 }
                             }
                         });
@@ -543,7 +545,7 @@ mod vec_codec {
             buf: &mut bytes::BytesMut,
         ) -> Result<(), Self::Error> {
             buf.reserve(data.len());
-            buf.put(data);
+            buf.put(&data[..]);
             Ok(())
         }
     }
@@ -556,6 +558,7 @@ mod tests {
     use std::env::temp_dir;
     use std::fs::{remove_file, File};
     use std::io::{Read, Write};
+    use tokio::io::{AsyncReadExt};
     use std::path::Path;
 
     fn dummy_transcode<P: AsRef<Path>, R: AsRef<Path>>(
@@ -575,10 +578,10 @@ mod tests {
         println!("Command is {:?}", cmd);
         let mut child = cmd.spawn().expect("Cannot spawn subprocess");
 
-        if child.stdout.is_some() {
+        if child.stdout().is_some() {
             let mut file = File::create(&out_file).expect("Cannot create output file");
             let mut buf = [0u8; 1024];
-            let mut out = child.stdout.take().unwrap();
+            let mut out = child.stdout().take().unwrap();
             loop {
                 match out.read(&mut buf) {
                     Ok(n) => {
