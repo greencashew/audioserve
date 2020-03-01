@@ -10,7 +10,7 @@ extern crate lazy_static;
 use config::{get_config, init_config};
 use futures::prelude::*;
 use hyper::server::conn::AddrIncoming;
-use hyper::Server as HttpServer;
+use hyper::{Server as HttpServer, service::make_service_fn};
 use ring::rand::{SecureRandom, SystemRandom};
 use services::auth::SharedSecretAuthenticator;
 use services::search::Search;
@@ -105,10 +105,12 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<std::
     let server: Box<dyn Future<Output = Result<(), hyper::Error>> + Send> =
         match get_config().ssl.as_ref() {
             None => {
-                let server = HttpServer::builder(incomming_connections).serve(move || {
+                let server = HttpServer::builder(incomming_connections).serve(
+                    
+                    make_service_fn(move |_| {
                     let s: Result<_, error::Error> = Ok(svc.clone());
-                    s
-                });
+                    future::ready(s)
+                }));
                 info!("Server listening on {}", &addr);
                 Box::new(server)
             }
@@ -165,9 +167,9 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<std::
 
     let mut rt = tokio::runtime::Builder::new()
         .threaded_scheduler()
+        .enable_all()
         .core_threads(cfg.thread_pool.num_threads as usize)
         .max_threads(cfg.thread_pool.num_threads as usize + cfg.thread_pool.queue_size as usize)
-        .keep_alive(cfg.thread_pool.keep_alive)
         .name_prefix("tokio-pool-")
         .build()
         .unwrap();
