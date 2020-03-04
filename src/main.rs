@@ -81,7 +81,7 @@ fn gen_my_secret<P: AsRef<Path>>(file: P) -> Result<Vec<u8>, io::Error> {
     }
 }
 
-fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<std::error::Error>> {
+fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<dyn std::error::Error>> {
     let cfg = get_config();
     let svc = FileSendService {
         authenticator: get_config().shared_secret.as_ref().map(
@@ -102,7 +102,7 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<std::
     let addr = cfg.listen;
     let incomming_connections = AddrIncoming::bind(&addr)?;
 
-    let server: Box<dyn Future<Output = Result<(), hyper::Error>> + Send> =
+    let server: Box<dyn Future<Output = Result<(), hyper::Error>> + Send + Unpin> =
         match get_config().ssl.as_ref() {
             None => {
                 let server = HttpServer::builder(incomming_connections).serve(
@@ -170,7 +170,6 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<std::
         .enable_all()
         .core_threads(cfg.thread_pool.num_threads as usize)
         .max_threads(cfg.thread_pool.num_threads as usize + cfg.thread_pool.queue_size as usize)
-        .name_prefix("tokio-pool-")
         .build()
         .unwrap();
 
@@ -239,7 +238,8 @@ fn main() {
             Ok(sig) => info!("Terminating by signal {}", sig),
             Err(e) => error!("Signal wait error: {}", e),
         }
-        runtime.shutdown_now();
+        //TODO - rather try async signals and Server::with_shutdown 
+        runtime.shutdown_timeout(std::time::Duration::from_millis(300));
 
         #[cfg(feature = "transcoding-cache")]
         {
@@ -254,7 +254,8 @@ fn main() {
 
     #[cfg(not(unix))]
     {
-        runtime.shutdown_on_idle().wait().unwrap();
+        // TODO: Does it work?
+        runtime.block_on(future::pending());
     }
     info!("Server finished");
 }
