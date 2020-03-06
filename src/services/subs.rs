@@ -205,7 +205,7 @@ pub struct ChunkStream<T> {
     buf: [u8; 8 * 1024],
 }
 
-impl<T: AsyncRead> Stream for ChunkStream<T> {
+impl<T: AsyncRead+Unpin> Stream for ChunkStream<T> {
     type Item = Result<Vec<u8>, io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
@@ -214,25 +214,25 @@ impl<T: AsyncRead> Stream for ChunkStream<T> {
             return Poll::Ready(None);
         }
         if self.remains == 0 {
-            self.as_mut().src.take();
+            self.get_mut().src.take();
             return Poll::Ready(None);
         }
-
+        let s = &mut self.get_mut();
         match ready! {
             {
-                // TODO: resolve unsafe - can we use Unpin
-            let pinned_stream = unsafe {Pin::new_unchecked(&mut self.src.unwrap())};
-            pinned_stream.poll_read(ctx, &mut self.buf)
+            
+            let pinned_stream = Pin::new(s.src.as_mut().unwrap());
+            pinned_stream.poll_read(ctx, &mut s.buf[..])
             }
         } {
             Ok(read) => {
                 if read == 0 {
-                    self.src.take();
+                    s.src.take();
                     Poll::Ready(None)
                 } else {
-                    let to_send = self.remains.min(read as u64);
-                    self.remains -= to_send;
-                    let chunk = self.buf[..to_send as usize].to_vec();
+                    let to_send = s.remains.min(read as u64);
+                    s.remains -= to_send;
+                    let chunk = s.buf[..to_send as usize].to_vec();
                     Poll::Ready(Some(Ok(chunk)))
                 }
             }
@@ -379,7 +379,7 @@ pub fn get_folder(
     ordering: FoldersOrdering,
 ) -> ResponseFuture {
     Box::pin(
-        blocking(|| list_dir(&base_path, &folder_path, ordering))
+        blocking(move|| list_dir(&base_path, &folder_path, ordering))
             .map_ok(|res| match res {
                 Ok(folder) => json_response(&folder),
                 Err(_) => short_response(StatusCode::NOT_FOUND, NOT_FOUND_MESSAGE),
@@ -457,10 +457,11 @@ pub fn download_folder(base_path: &'static Path, folder_path: PathBuf) -> Respon
 
 fn json_response<T: serde::Serialize>(data: &T) -> Response {
     let json = serde_json::to_string(data).expect("Serialization error");
-    HyperResponse::builder()
-        .typed_header(ContentType::json())
-        .typed_header(ContentLength(json.len() as u64))
-        .body(json.into())
+
+    let mut res = HyperResponse::builder();
+    res.typed_header(ContentType::json());
+    res.typed_header(ContentLength(json.len() as u64));
+    res.body(json.into())
         .unwrap()
 }
 
@@ -491,7 +492,7 @@ pub fn search(
     ordering: FoldersOrdering,
 ) -> ResponseFuture {
     Box::pin(
-        blocking(|| {
+        blocking(move || {
             let res = searcher.search(collection, query, ordering);
             json_response(&res)
         })
@@ -501,7 +502,7 @@ pub fn search(
 
 pub fn recent(collection: usize, searcher: Search<String>) -> ResponseFuture {
     Box::pin(
-        blocking(|| {
+        blocking(move || {
             let res = searcher.recent(collection);
             json_response(&res)
         })
