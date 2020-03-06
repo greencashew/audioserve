@@ -359,7 +359,7 @@ impl Transcoder {
             }
             Ok((cache_file, cache_finish)) => {
                 future::ready(self.transcode_inner(file, seek, span, counter)
-                    .map(|(stream, f)| {
+                    .map(|(mut stream, f)| {
                         tokio::spawn(f.then(|res| {
                             fn box_me<I, E, F: Future<Output = Result<I, E>> + 'static + Send>(
                                 f: F,
@@ -399,14 +399,15 @@ impl Transcoder {
                         let cache_sink =
                             tokio_util::codec::FramedWrite::new(cache_file, self::vec_codec::VecEncoder);
                         let (tx, rx) = mpsc::channel(64);
-                        let tx = cache_sink
+                        let mut tx = cache_sink
                             .fanout(tx.sink_map_err(|e| io::Error::new(io::ErrorKind::Other, e)));
-                        tokio::spawn(tx.send_all(&mut stream).then(|res| {
-                            if let Err(e) = res {
-                                warn!("Error in channel: {}", e)
-                            }
-                            future::ok::<(),()>(())
-                        }));
+                        let f = async move {
+                            let done = tx.send_all(&mut stream).await;
+                            if let Err(e) = done {
+                                    warn!("Error in channel: {}", e)
+                                }
+                        };
+                        tokio::spawn(f);
                         Box::pin(rx
                             .map(|i| {
                             Ok(i)

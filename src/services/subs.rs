@@ -11,8 +11,6 @@ use crate::error::Error;
 use crate::util::{checked_dec, into_range_bounds, to_satisfiable_range, ResponseBuilderExt};
 use futures::prelude::*;
 use futures::{future, ready, Stream};
-use std::task::{Poll, Context};
-use std::pin::Pin;
 use headers::{AcceptRanges, CacheControl, ContentLength, ContentRange, ContentType, LastModified};
 #[cfg(feature = "folder-download")]
 use hyper::header::CONTENT_DISPOSITION;
@@ -24,7 +22,9 @@ use std::collections::Bound;
 use std::ffi::OsStr;
 use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
+use std::task::{Context, Poll};
 use tokio::io::AsyncRead;
 use tokio::task::spawn_blocking as blocking;
 
@@ -38,11 +38,10 @@ type Response = HyperResponse<Body>;
 pub type ResponseFuture = Pin<Box<dyn Future<Output = Result<Response, Error>> + Send>>;
 
 pub fn short_response(status: StatusCode, msg: &'static str) -> Response {
-    HyperResponse::builder()
-        .status(status)
-        .typed_header(ContentLength(msg.len() as u64))
-        .body(msg.into())
-        .unwrap()
+    let mut res =  HyperResponse::builder();
+    res = res.status(status);
+    res.typed_header(ContentLength(msg.len() as u64));
+    res.body(msg.into()).unwrap()
 }
 
 pub fn short_response_boxed(status: StatusCode, msg: &'static str) -> ResponseFuture {
@@ -181,10 +180,10 @@ fn serve_file_transcoded(
         .transcode(full_path, seek, span, counter.clone(), transcoding_quality)
         .then(move |res| match res {
             Ok(stream) => {
-                let resp = HyperResponse::builder()
-                    .typed_header(ContentType::from(mime))
-                    .header("X-Transcode", params.as_bytes())
-                    .body(Body::wrap_stream(stream.map_err(Error::new_with_cause)))
+                let mut resp = HyperResponse::builder();
+                resp.typed_header(ContentType::from(mime));
+                resp = resp.header("X-Transcode", params.as_bytes());
+                let resp = resp.body(Body::wrap_stream(stream.map_err(Error::new_with_cause)))
                     .unwrap();
 
                 future::ok(resp)
@@ -209,13 +208,13 @@ pub struct ChunkStream<T> {
 impl<T: AsyncRead> Stream for ChunkStream<T> {
     type Item = Result<Vec<u8>, io::Error>;
 
-    fn poll_next(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
         if self.src.is_none() {
             error!("Polling after stream is done");
             return Poll::Ready(None);
         }
         if self.remains == 0 {
-            self.src.take();
+            self.as_mut().src.take();
             return Poll::Ready(None);
         }
 
@@ -225,8 +224,8 @@ impl<T: AsyncRead> Stream for ChunkStream<T> {
             let pinned_stream = unsafe {Pin::new_unchecked(&mut self.src.unwrap())};
             pinned_stream.poll_read(ctx, &mut self.buf)
             }
-        }{
-            Ok(read) =>
+        } {
+            Ok(read) => {
                 if read == 0 {
                     self.src.take();
                     Poll::Ready(None)
@@ -236,8 +235,9 @@ impl<T: AsyncRead> Stream for ChunkStream<T> {
                     let chunk = self.buf[..to_send as usize].to_vec();
                     Poll::Ready(Some(Ok(chunk)))
                 }
-            Err(e) => Poll::Ready(Some(Err(e)))
-    }
+            }
+            Err(e) => Poll::Ready(Some(Err(e))),
+        }
     }
 }
 
@@ -254,56 +254,55 @@ impl<T: AsyncRead> ChunkStream<T> {
     }
 }
 
-fn serve_opened_file(
-    file: tokio::fs::File,
+async fn serve_opened_file(
+    mut file: tokio::fs::File,
     range: Option<ByteRenge>,
     caching: Option<u32>,
     mime: mime::Mime,
-) -> impl Future<Output = Result<Response, io::Error>> {
-    file.metadata().and_then(move |meta| {
-        let file_len = meta.len();
-        if file_len == 0 {
-            warn!("File has zero size ")
+) -> Result<Response, io::Error> {
+    let meta = file.metadata().await?;
+    let file_len = meta.len();
+    if file_len == 0 {
+        warn!("File has zero size ")
+    }
+    let last_modified = meta.modified().ok();
+    let mut resp = HyperResponse::builder();
+    resp.typed_header(ContentType::from(mime));
+    if let Some(age) = caching {
+        let cache = CacheControl::new()
+            .with_public()
+            .with_max_age(std::time::Duration::from_secs(u64::from(age)));
+        resp.typed_header(cache);
+        if let Some(last_modified) = last_modified {
+            resp.typed_header(LastModified::from(last_modified));
         }
-        let last_modified = meta.modified().ok();
-        let mut resp = HyperResponse::builder();
-        resp.typed_header(ContentType::from(mime));
-        if let Some(age) = caching {
-            let cache = CacheControl::new()
-                .with_public()
-                .with_max_age(std::time::Duration::from_secs(u64::from(age)));
-            resp.typed_header(cache);
-            if let Some(last_modified) = last_modified {
-                resp.typed_header(LastModified::from(last_modified));
-            }
-        }
+    }
 
-        let (start, end) = match range {
-            Some(range) => match to_satisfiable_range(range, file_len) {
-                Some(l) => {
-                    resp.status(StatusCode::PARTIAL_CONTENT);
-                    let h = ContentRange::bytes(into_range_bounds(l), Some(file_len)).unwrap();
-                    resp.typed_header(h);
-                    l
-                }
-                None => {
-                    error!("Wrong range {:?}", range);
-                    (0, checked_dec(file_len))
-                }
-            },
+    let (start, end) = match range {
+        Some(range) => match to_satisfiable_range(range, file_len) {
+            Some(l) => {
+                resp = resp.status(StatusCode::PARTIAL_CONTENT);
+                let h = ContentRange::bytes(into_range_bounds(l), Some(file_len)).unwrap();
+                resp.typed_header(h);
+                l
+            }
             None => {
-                resp.status(StatusCode::OK);
-                resp.typed_header(AcceptRanges::bytes());
+                error!("Wrong range {:?}", range);
                 (0, checked_dec(file_len))
             }
-        };
-        file.seek(SeekFrom::Start(start)).map(move |_pos| {
-            let stream = ChunkStream::new_with_limit(file, end - start + 1);
-            Ok(resp.typed_header(ContentLength(end - start + 1))
-                .body(Body::wrap_stream(stream))
-                .unwrap())
-        })
-    })
+        },
+        None => {
+            resp = resp.status(StatusCode::OK);
+            resp.typed_header(AcceptRanges::bytes());
+            (0, checked_dec(file_len))
+        }
+    };
+    let pos = file.seek(SeekFrom::Start(start)).await;
+    let stream = ChunkStream::new_with_limit(file, end - start + 1);
+    resp.typed_header(ContentLength(end - start + 1));
+    Ok(resp
+        .body(Body::wrap_stream(stream))
+        .unwrap())
 }
 
 fn serve_file_from_fs(
@@ -492,23 +491,20 @@ pub fn search(
     ordering: FoldersOrdering,
 ) -> ResponseFuture {
     Box::pin(
-        
         blocking(|| {
-                let res = searcher.search(collection, query, ordering);
-                json_response(&res)
-            })
+            let res = searcher.search(collection, query, ordering);
+            json_response(&res)
+        })
         .map_err(Error::new_with_cause),
     )
 }
 
 pub fn recent(collection: usize, searcher: Search<String>) -> ResponseFuture {
     Box::pin(
-        
-            blocking(|| {
-                let res = searcher.recent(collection);
-                json_response(&res)
-            })
-            .map_err(Error::new_with_cause)
-        
+        blocking(|| {
+            let res = searcher.recent(collection);
+            json_response(&res)
+        })
+        .map_err(Error::new_with_cause),
     )
 }

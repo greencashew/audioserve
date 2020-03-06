@@ -75,8 +75,9 @@ struct HeadersExtender<'a, 'b> {
 
 impl<'a, 'b> Extend<HeaderValue> for HeadersExtender<'a, 'b> {
     fn extend<I: IntoIterator<Item = HeaderValue>>(&mut self, iter: I) {
+        let headers = self.builder.headers_mut().unwrap(); // TODO is it always safe to unwrap()?
         for v in iter.into_iter() {
-            self.builder.header(self.name, v);
+            headers.insert(self.name, v);
         }
     }
 }
