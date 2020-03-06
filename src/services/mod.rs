@@ -86,7 +86,7 @@ fn add_cors_headers(
 impl<C: 'static> Service<Request<Body>> for FileSendService<C> {
     type Response = Response<Body>;
     type Error = crate::error::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response,  Self::Error>> + Send+Unpin>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response,  Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -120,12 +120,12 @@ impl<C: 'static> Service<Request<Body>> for FileSendService<C> {
                     Ok((req, _creds)) => {
                         FileSendService::<C>::process_checked(req, searcher, transcoding)
                     }
-                    Err(resp) => Box::new(future::ok(resp)),
+                    Err(resp) => Box::pin(future::ok(resp)),
                 }))
             }
             None => FileSendService::<C>::process_checked(req, searcher, transcoding),
         };
-        Box::pin(resp.map(move |r| add_cors_headers(r, origin, cors)))
+        Box::pin(resp.map_ok(move |r| add_cors_headers(r, origin, cors)))
     }
 }
 

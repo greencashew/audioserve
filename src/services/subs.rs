@@ -187,11 +187,11 @@ fn serve_file_transcoded(
                     .body(Body::wrap_stream(stream.map_err(Error::new_with_cause)))
                     .unwrap();
 
-                Ok(resp)
+                future::ok(resp)
             }
             Err(e) => {
                 error!("Cannot create transcoded stream, error: {}", e);
-                Ok(short_response(
+                future::ok(short_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     SEVER_ERROR_TRANSCODING,
                 ))
