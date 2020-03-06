@@ -60,7 +60,7 @@ async fn server_upgrade(req: Request<Body>) -> Result<Response<Body>, io::Error>
             *c
         };
 
-        Box::new(future::ok(Some(ws::Message::text(
+        Box::pin(future::ok(Some(ws::Message::text(
             format!("{}: {}", counter, m.to_str().unwrap()),
             m.context(),
         ))))

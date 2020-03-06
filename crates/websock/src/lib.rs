@@ -57,7 +57,7 @@ where
     T: Default + Send + Sync + 'static,
     F: FnMut(
             Message<T>,
-        ) -> Box<dyn Future<Output = Result<Option<Message<T>>, Error>> + Send + Unpin>
+        ) -> Pin<Box<dyn Future<Output = Result<Option<Message<T>>, Error>> + Send>>
         + Send
         + 'static,
 {
@@ -69,12 +69,12 @@ where
                 rc.and_then(move |m| match m.inner {
                     protocol::Message::Ping(p) => { // Send Pong for Ping
                         debug!("Got ping {:?}", p);
-                        Box::new(future::ok(Some(Message {
+                        Box::pin(future::ok(Some(Message {
                             inner: protocol::Message::Pong(p),
                             context: m.context,
                         })))
                     }
-                    protocol::Message::Close(_)=> Box::new(future::ok(None)), // No response for Close message
+                    protocol::Message::Close(_)=> Box::pin(future::ok(None)), // No response for Close message
                     _ => f(m),
                 })
                 .try_filter_map(|m| async { Ok(m) })

@@ -21,6 +21,7 @@ use std::path::Path;
 use std::process;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::pin::Pin;
 
 #[cfg(feature = "tls")]
 use native_tls::Identity;
@@ -102,7 +103,7 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<dyn s
     let addr = cfg.listen;
     let incomming_connections = AddrIncoming::bind(&addr)?;
 
-    let server: Box<dyn Future<Output = Result<(), hyper::Error>> + Send + Unpin> =
+    let server: Pin<Box<dyn Future<Output = Result<(), hyper::Error>> + Send>> =
         match get_config().ssl.as_ref() {
             None => {
                 let server = HttpServer::builder(incomming_connections).serve(
@@ -112,7 +113,7 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<dyn s
                     future::ready(s)
                 }));
                 info!("Server listening on {}", &addr);
-                Box::new(server)
+                Box::pin(server)
             }
             Some(ssl) => {
                 #[cfg(feature = "tls")]
@@ -150,7 +151,7 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<dyn s
                         s
                     });
                     info!("Server Listening on {} with TLS", &addr);
-                    Box::new(server)
+                    Box::pin(server)
                 }
 
                 #[cfg(not(feature = "tls"))]
