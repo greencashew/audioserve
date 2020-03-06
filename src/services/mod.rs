@@ -23,6 +23,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use url::form_urlencoded;
 use std::task::Poll;
+use std::pin::Pin;
 
 pub mod audio_folder;
 pub mod audio_meta;
@@ -85,7 +86,7 @@ fn add_cors_headers(
 impl<C: 'static> Service<Request<Body>> for FileSendService<C> {
     type Response = Response<Body>;
     type Error = crate::error::Error;
-    type Future = Box<dyn Future<Output = Result<Self::Response,  Self::Error>> + Send+Unpin>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response,  Self::Error>> + Send+Unpin>>;
 
     fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -115,7 +116,7 @@ impl<C: 'static> Service<Request<Body>> for FileSendService<C> {
 
         let resp = match self.authenticator {
             Some(ref auth) => {
-                Box::new(auth.authenticate(req).and_then(move |result| match result {
+                Box::pin(auth.authenticate(req).and_then(move |result| match result {
                     Ok((req, _creds)) => {
                         FileSendService::<C>::process_checked(req, searcher, transcoding)
                     }
@@ -124,7 +125,7 @@ impl<C: 'static> Service<Request<Body>> for FileSendService<C> {
             }
             None => FileSendService::<C>::process_checked(req, searcher, transcoding),
         };
-        Box::new(resp.map(move |r| add_cors_headers(r, origin, cors)))
+        Box::pin(resp.map(move |r| add_cors_headers(r, origin, cors)))
     }
 }
 

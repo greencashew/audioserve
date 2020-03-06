@@ -35,7 +35,7 @@ const SEVER_ERROR_TRANSCODING: &str = "Server error during transcoding process";
 
 type Response = HyperResponse<Body>;
 
-pub type ResponseFuture = Box<dyn Future<Output = Result<Response, Error>> + Send +Unpin>;
+pub type ResponseFuture = Pin<Box<dyn Future<Output = Result<Response, Error>> + Send>>;
 
 pub fn short_response(status: StatusCode, msg: &'static str) -> Response {
     HyperResponse::builder()
@@ -46,7 +46,7 @@ pub fn short_response(status: StatusCode, msg: &'static str) -> Response {
 }
 
 pub fn short_response_boxed(status: StatusCode, msg: &'static str) -> ResponseFuture {
-    Box::new(future::ok(short_response(status, msg)))
+    Box::pin(future::ok(short_response(status, msg)))
 }
 
 #[cfg(not(feature = "transcoding-cache"))]
@@ -77,7 +77,7 @@ fn serve_file_cached_or_transcoded(
     transcoding_quality: QualityLevel,
 ) -> ResponseFuture {
     if get_config().transcoding.cache.disabled {
-        return Box::new(serve_file_transcoded_checked(
+        return Box::pin(serve_file_transcoded_checked(
             AudioFilePath::Original(full_path),
             seek,
             span,
@@ -124,7 +124,7 @@ fn serve_file_cached_or_transcoded(
                     let mime = get_config()
                         .transcoder(transcoding_quality)
                         .transcoded_mime();
-                    Box::new(serve_opened_file(f, range, None, mime).map_err(|e| {
+                    Box::pin(serve_opened_file(f, range, None, mime).map_err(|e| {
                         error!("Error sending cached file: {}", e);
                         Error::new_with_cause(e)
                     }))
@@ -132,7 +132,7 @@ fn serve_file_cached_or_transcoded(
             }
         });
 
-    Box::new(fut)
+    Box::pin(fut)
 }
 
 fn serve_file_transcoded_checked(
@@ -147,7 +147,7 @@ fn serve_file_transcoded_checked(
     let running_transcodings: u32 = counter.load(Ordering::SeqCst) as u32;
     if running_transcodings >= transcoding.max_transcodings {
         warn!("Max transcodings reached {}", transcoding.max_transcodings);
-        Box::new(future::ok(short_response(
+        Box::pin(future::ok(short_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Max transcodings reached",
         )))
@@ -197,7 +197,7 @@ fn serve_file_transcoded(
                 ))
             }
         });
-    Box::new(fut)
+    Box::pin(fut)
 }
 
 pub struct ChunkStream<T> {
@@ -314,7 +314,7 @@ fn serve_file_from_fs(
     let filename: PathBuf = full_path.into(); // we need to copy for lifetime issues as File::open and closures require 'static lifetime
     let filename2: PathBuf = full_path.into();
     let filename3: PathBuf = full_path.into();
-    Box::new(
+    Box::pin(
         tokio::fs::File::open(filename)
             .and_then(move |file| {
                 let mime = guess_mime_type(filename2);
@@ -379,7 +379,7 @@ pub fn get_folder(
     folder_path: PathBuf,
     ordering: FoldersOrdering,
 ) -> ResponseFuture {
-    Box::new(
+    Box::pin(
         blocking(|| list_dir(&base_path, &folder_path, ordering))
             .map_ok(|res| match res {
                 Ok(folder) => json_response(&folder),
@@ -477,12 +477,12 @@ pub fn collections_list() -> ResponseFuture {
             .map(|p| p.file_name().and_then(OsStr::to_str).unwrap_or(UKNOWN_NAME))
             .collect(),
     };
-    Box::new(future::ok(json_response(&collections)))
+    Box::pin(future::ok(json_response(&collections)))
 }
 
 pub fn transcodings_list() -> ResponseFuture {
     let transcodings = Transcodings::new();
-    Box::new(future::ok(json_response(&transcodings)))
+    Box::pin(future::ok(json_response(&transcodings)))
 }
 
 pub fn search(
@@ -491,7 +491,7 @@ pub fn search(
     query: String,
     ordering: FoldersOrdering,
 ) -> ResponseFuture {
-    Box::new(
+    Box::pin(
         
         blocking(|| {
                 let res = searcher.search(collection, query, ordering);
@@ -502,7 +502,7 @@ pub fn search(
 }
 
 pub fn recent(collection: usize, searcher: Search<String>) -> ResponseFuture {
-    Box::new(
+    Box::pin(
         
             blocking(|| {
                 let res = searcher.recent(collection);

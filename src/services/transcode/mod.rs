@@ -14,6 +14,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::time::delay_for;
 use tokio::process::{ChildStdout, Command};
+use std::pin::Pin;
 
 #[cfg(feature = "transcoding-cache")]
 pub mod cache;
@@ -193,7 +194,7 @@ pub struct Transcoder {
 type TranscodedStream =
     Box<dyn futures::Stream<Item = Result<Vec<u8>,std::io::Error>> + Send + 'static>;
 #[cfg(feature = "transcoding-cache")]
-type TranscodedFuture = Box<dyn Future<Output = Result<TranscodedStream, Error>> + Send>;
+type TranscodedFuture = Pin<Box<dyn Future<Output = Result<TranscodedStream, Error>> + Send>>;
 
 impl Transcoder {
     pub fn new(quality: TranscodingFormat) -> Self {
@@ -334,7 +335,7 @@ impl Transcoder {
         };
         if is_transcoded || seek.is_some() || get_config().transcoding.cache.disabled {
             debug!("Shoud not add to cache as is already transcoded, seeking or cache is disabled");
-            return Box::new(future::ready(
+            return Box::pin(future::ready(
                 self.transcode_inner(file, seek, span, counter)
                     .map(|(stream, f)| {
                         tokio::spawn(f);
@@ -362,9 +363,9 @@ impl Transcoder {
                         tokio::spawn(f.then(|res| {
                             fn box_me<I, E, F: Future<Output = Result<I, E>> + 'static + Send>(
                                 f: F,
-                            ) -> Box<Future<Output = Result<I, E>> + 'static + Send>
+                            ) -> Pin<Box<Future<Output = Result<I, E>> + 'static + Send>>
                             {
-                                Box::new(f)
+                                Box::pin(f)
                             };
 
                             match res {
@@ -406,7 +407,7 @@ impl Transcoder {
                             }
                             future::ok(())
                         }));
-                        Box::new(rx
+                        Box::pin(rx
                             .map_err(|_| {
                             error!("Error in chanel");
                             io::Error::new(io::ErrorKind::Other, "Error in channel")
@@ -415,7 +416,7 @@ impl Transcoder {
                     })
                 )}
         });
-        Box::new(fut)
+        Box::pin(fut)
     }
 
     fn transcode_inner<S: AsRef<OsStr> + Debug + Send + 'static>(

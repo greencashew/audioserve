@@ -13,9 +13,10 @@ use std::borrow;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::form_urlencoded;
+use std::pin::Pin;
 
 type AuthResult<T> = Result<(Request<Body>, T), Response<Body>>;
-type AuthFuture<T> = Box<dyn Future<Output = Result<AuthResult<T>, Error>> + Send>;
+type AuthFuture<T> = Pin<Box<dyn Future<Output = Result<AuthResult<T>, Error>> + Send>>;
 
 pub trait Authenticator: Send + Sync {
     type Credentials;
@@ -52,7 +53,7 @@ impl Authenticator for SharedSecretAuthenticator {
         if req.method() == Method::POST && req.uri().path() == "/authenticate" {
             debug!("Authentication request");
             let auth = self.clone();
-            return Box::new(
+            return Box::pin(
                 hyper::body::to_bytes(req.into_body())
                     .map_err(Error::new_with_cause)
                     .map_ok(move |b| {
@@ -101,11 +102,11 @@ impl Authenticator for SharedSecretAuthenticator {
             }
 
             if token.is_none() || !self.token_ok(&token.unwrap()) {
-                return Box::new(future::ok(deny()));
+                return Box::pin(future::ok(deny()));
             }
         }
         // If everything is ok we return credentials (in this case they are just unit type) and we return back request
-        Box::new(future::ok(Ok((req, ()))))
+        Box::pin(future::ok(Ok((req, ()))))
     }
 }
 
