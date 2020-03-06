@@ -192,7 +192,7 @@ pub struct Transcoder {
 
 #[cfg(feature = "transcoding-cache")]
 type TranscodedStream =
-    Box<dyn futures::Stream<Item = Result<Vec<u8>,std::io::Error>> + Send + 'static>;
+    Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>,std::io::Error>> + Send + 'static>>;
 #[cfg(feature = "transcoding-cache")]
 type TranscodedFuture = Pin<Box<dyn Future<Output = Result<TranscodedStream, Error>> + Send>>;
 
@@ -339,7 +339,7 @@ impl Transcoder {
                 self.transcode_inner(file, seek, span, counter)
                     .map(|(stream, f)| {
                         tokio::spawn(f);
-                        Box::new(stream) as TranscodedStream
+                        Box::pin(stream) as TranscodedStream
                     }),
             ));
         }
@@ -354,7 +354,7 @@ impl Transcoder {
                     .map(|(stream, f)| {
                         tokio::spawn(f);
 
-                        Box::new(stream) as TranscodedStream
+                        Box::pin(stream) as TranscodedStream
                     }))
             }
             Ok((cache_file, cache_finish)) => {
@@ -363,7 +363,7 @@ impl Transcoder {
                         tokio::spawn(f.then(|res| {
                             fn box_me<I, E, F: Future<Output = Result<I, E>> + 'static + Send>(
                                 f: F,
-                            ) -> Pin<Box<Future<Output = Result<I, E>> + 'static + Send>>
+                            ) -> Pin<Box<dyn Future<Output = Result<I, E>> + 'static + Send>>
                             {
                                 Box::pin(f)
                             };
@@ -405,13 +405,13 @@ impl Transcoder {
                             if let Err(e) = res {
                                 warn!("Error in channel: {}", e)
                             }
-                            future::ok(())
+                            future::ok::<(),()>(())
                         }));
                         Box::pin(rx
-                            .map_err(|_| {
-                            error!("Error in chanel");
-                            io::Error::new(io::ErrorKind::Other, "Error in channel")
-                        })
+                            .map(|i| {
+                            Ok(i)
+                        }
+                        )
                             ) as TranscodedStream
                     })
                 )}
