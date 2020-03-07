@@ -60,7 +60,7 @@ fn gen_my_secret<P: AsRef<Path>>(file: P) -> Result<Vec<u8>, io::Error> {
         let mut random = [0u8; 32];
         let rng = SystemRandom::new();
         rng.fill(&mut random)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, "Error when generating secret"))?;
+            .map_err(|_e| io::Error::new(io::ErrorKind::Other, "Error when generating secret"))?;
         let mut f;
         #[cfg(unix)]
         {
@@ -101,7 +101,8 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<dyn s
         },
     };
     let addr = cfg.listen;
-    let incomming_connections = AddrIncoming::bind(&addr)?;
+    let f = async move {
+        let incomming_connections = AddrIncoming::bind(&addr)?;
 
     let server: Pin<Box<dyn Future<Output = Result<(), hyper::Error>> + Send>> =
         match get_config().ssl.as_ref() {
@@ -164,9 +165,12 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<dyn s
             }
         };
 
-    let server = server.map_err(|e| error!("Cannot start HTTP server due to error {}", e));
+     //let server = server.map_err(|e| error!("Cannot start HTTP server due to error {}", e));
+     server.await
+    };
+    
 
-    let mut rt = tokio::runtime::Builder::new()
+    let rt = tokio::runtime::Builder::new()
         .threaded_scheduler()
         .enable_all()
         .core_threads(cfg.thread_pool.num_threads as usize)
@@ -174,7 +178,7 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<dyn s
         .build()
         .unwrap();
 
-    rt.spawn(server);
+    rt.spawn(f);
 
     Ok(rt)
 }

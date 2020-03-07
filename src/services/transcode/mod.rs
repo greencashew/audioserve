@@ -5,7 +5,6 @@ use crate::config::get_config;
 use crate::error::Error;
 use futures::future::Either;
 use futures::prelude::*;
-use futures::stream::{TryStreamExt};
 use mime::Mime;
 use std::ffi::OsStr;
 use std::fmt::Debug;
@@ -325,7 +324,6 @@ impl Transcoder {
     ) -> TranscodedFuture {
         use self::cache::{cache_key, get_cache};
         use futures::channel::mpsc;
-        use futures::{Sink, Stream};
         use std::io;
 
         let is_transcoded = if let AudioFilePath::Transcoded(_) = file {
@@ -439,10 +437,10 @@ impl Transcoder {
         let counter2 = counter.clone();
         match cmd.spawn() {
             Ok(mut child) => {
-                if child.stdout().is_some() {
+                if child.stdout.is_some() {
                     counter.fetch_add(1, Ordering::SeqCst);
                     let start = Instant::now();
-                    let out = child.stdout().take().unwrap();
+                    let out = child.stdout.take().unwrap();
                     let stream = ChunkStream::new(out);
                     let pid = child.id();
                     debug!("waiting for transcode process to end");
@@ -578,6 +576,10 @@ mod tests {
             Some(ref p) => t.build_remux_command(p.as_ref(), seek, span, false),
         };
         println!("Command is {:?}", cmd);
+
+        let f = async move {
+            
+        };
         let mut child = cmd.spawn().expect("Cannot spawn subprocess");
 
         if child.stdout().is_some() {

@@ -1,8 +1,7 @@
 use super::transcode::{QualityLevel, TranscodingFormat};
 use crate::config::get_config;
-use crate::util::os_to_string;
+use crate::util::{os_to_string, guess_mime_type};
 use mime::Mime;
-use mime_guess::guess_mime_type;
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;

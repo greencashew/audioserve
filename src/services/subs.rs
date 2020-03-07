@@ -8,7 +8,7 @@ use super::types::*;
 use super::Counter;
 use crate::config::get_config;
 use crate::error::Error;
-use crate::util::{checked_dec, into_range_bounds, to_satisfiable_range, ResponseBuilderExt};
+use crate::util::{checked_dec, into_range_bounds, to_satisfiable_range, ResponseBuilderExt, guess_mime_type};
 use futures::prelude::*;
 use futures::{future, ready, Stream};
 use headers::{AcceptRanges, CacheControl, ContentLength, ContentRange, ContentType, LastModified};
@@ -16,7 +16,6 @@ use headers::{AcceptRanges, CacheControl, ContentLength, ContentRange, ContentTy
 use hyper::header::CONTENT_DISPOSITION;
 use hyper::{Body, Response as HyperResponse, StatusCode};
 use mime;
-use mime_guess::guess_mime_type;
 use serde_json;
 use std::collections::Bound;
 use std::ffi::OsStr;
@@ -208,7 +207,7 @@ pub struct ChunkStream<T> {
 impl<T: AsyncRead+Unpin> Stream for ChunkStream<T> {
     type Item = Result<Vec<u8>, io::Error>;
 
-    fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
         if self.src.is_none() {
             error!("Polling after stream is done");
             return Poll::Ready(None);
@@ -297,7 +296,7 @@ async fn serve_opened_file(
             (0, checked_dec(file_len))
         }
     };
-    let pos = file.seek(SeekFrom::Start(start)).await;
+    let _pos = file.seek(SeekFrom::Start(start)).await;
     let stream = ChunkStream::new_with_limit(file, end - start + 1);
     resp.typed_header(ContentLength(end - start + 1));
     Ok(resp

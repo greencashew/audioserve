@@ -88,7 +88,7 @@ impl<C: 'static> Service<Request<Body>> for FileSendService<C> {
     type Error = crate::error::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response,  Self::Error>> + Send>>;
 
-    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 

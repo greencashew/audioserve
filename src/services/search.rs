@@ -18,7 +18,7 @@ struct FoldersSearch;
 
 #[derive(Clone)]
 pub struct Search<S: AsRef<str>> {
-    inner: Arc<Box<SearchTrait<S> + Send + Sync>>,
+    inner: Arc<Box<dyn SearchTrait<S> + Send + Sync>>,
 }
 
 impl<S: AsRef<str>> SearchTrait<S> for Search<S> {

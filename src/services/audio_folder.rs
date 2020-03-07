@@ -9,7 +9,7 @@ use super::audio_meta::{get_audio_properties, Chapter, MediaInfo};
 use super::transcode::TimeSpan;
 use super::types::*;
 use crate::config::get_config;
-use crate::util::os_to_string;
+use crate::util::{os_to_string, guess_mime_type};
 use regex::Regex;
 
 pub fn list_dir<P: AsRef<Path>, P2: AsRef<Path>>(
@@ -213,7 +213,7 @@ fn list_dir_file<P: AsRef<Path>>(
     chapters: Vec<Chapter>,
 ) -> Result<AudioFolder, io::Error> {
     let path = full_path.strip_prefix(&base_dir).unwrap();
-    let mime = ::mime_guess::guess_mime_type(&path);
+    let mime = guess_mime_type(&path);
     let files = chapters
         .into_iter()
         .map(|chap| {
@@ -276,7 +276,7 @@ fn list_dir_dir<P: AsRef<Path>>(
                                 )?)
                             } else if ft.is_file() {
                                 if is_audio(&path) {
-                                    let mime = ::mime_guess::guess_mime_type(&path);
+                                    let mime = guess_mime_type(&path);
                                     let audio_file_path = base_dir.as_ref().join(&path);
                                     let meta = match get_audio_properties(&audio_file_path) {
                                         Ok(meta) => meta,
