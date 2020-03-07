@@ -9,7 +9,6 @@ extern crate lazy_static;
 
 use config::{get_config, init_config};
 use futures::prelude::*;
-use hyper::server::conn::AddrIncoming;
 use hyper::{service::make_service_fn, Server as HttpServer};
 use ring::rand::{SecureRandom, SystemRandom};
 use services::auth::SharedSecretAuthenticator;
@@ -23,26 +22,12 @@ use std::process;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-#[cfg(feature = "tls")]
-use native_tls::Identity;
-
 mod config;
 mod error;
 mod services;
 mod util;
-
 #[cfg(feature = "tls")]
-fn load_private_key<P>(file: P, pass: &str) -> Result<Identity, io::Error>
-where
-    P: AsRef<Path>,
-{
-    let mut bytes = vec![];
-    let mut f = File::open(file)?;
-    f.read_to_end(&mut bytes)?;
-    let key =
-        Identity::from_pkcs12(&bytes, pass).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    Ok(key)
-}
+mod tls;
 
 fn generate_server_secret<P: AsRef<Path>>(file: P) -> Result<Vec<u8>, io::Error> {
     let file = file.as_ref();
@@ -82,9 +67,11 @@ fn generate_server_secret<P: AsRef<Path>>(file: P) -> Result<Vec<u8>, io::Error>
     }
 }
 
+type RuntimeError = Box<dyn std::error::Error+'static>;
+
 fn start_server(
     server_secret: Vec<u8>,
-) -> Result<tokio::runtime::Runtime, Box<dyn std::error::Error>> {
+) -> Result<tokio::runtime::Runtime, RuntimeError> {
     let cfg = get_config();
     let svc = FileSendService {
         authenticator: get_config().shared_secret.as_ref().map(
@@ -104,54 +91,33 @@ fn start_server(
     };
     let addr = cfg.listen;
     let start_server = async move {
-        let incoming_connections = AddrIncoming::bind(&addr)?;
+        
 
-        let server: Pin<Box<dyn Future<Output = Result<(), hyper::Error>> + Send>> =
+        let server: Pin<Box<dyn Future<Output = Result<(), RuntimeError>> + Send>> =
             match get_config().ssl.as_ref() {
                 None => {
-                    let server = HttpServer::builder(incoming_connections).serve(make_service_fn(
+                    let server = HttpServer::bind(&addr).serve(make_service_fn(
                         move |_| future::ok::<_, error::Error>(svc.clone()),
                     ));
                     info!("Server listening on {}", &addr);
-                    Box::pin(server)
+                    Box::pin(server.map_err(|e| e.into()))
                 }
                 Some(ssl) => {
                     #[cfg(feature = "tls")]
-                    {
-                        use futures::Stream;
-                        let private_key = match load_private_key(&ssl.key_file, &ssl.key_password) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                error!("Error loading SSL/TLS private key: {}", e);
-                                return Err(Box::new(e));
-                            }
-                        };
-                        let tls_cx = native_tls::TlsAcceptor::builder(private_key).build()?;
-                        let tls_cx = tokio_tls::TlsAcceptor::from(tls_cx);
-
-                        let incoming = incoming_connections
-                            .and_then(move |socket| {
-                                tls_cx
-                                    .accept(socket)
-                                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-                            })
-                            // we need to skip TLS errors, so we can accept next connection, otherwise
-                            // stream will end and server will stop listening
-                            .then(|res| match res {
-                                Ok(conn) => Ok::<_, io::Error>(Some(conn)),
-                                Err(e) => {
-                                    error!("TLS error: {}", e);
-                                    Ok(None)
-                                }
-                            })
-                            .filter_map(|x| x);
-
-                        let server = HttpServer::builder(incoming).serve(move || {
-                            let s: Result<_, error::Error> = Ok(svc.clone());
-                            s
-                        });
+                    {   
                         info!("Server Listening on {} with TLS", &addr);
-                        Box::pin(server)
+                        let create_server = async move {
+                            let incoming = tls::tls_acceptor(&addr,&ssl).await?;
+                            let server = HttpServer::builder(incoming).serve(make_service_fn(
+                                move |_| future::ok::<_, error::Error>(svc.clone()),
+                            )).await;
+                            
+                            server.map_err(|e| e.into())
+                        };
+                        
+
+                        
+                        Box::pin(create_server)
                     }
 
                     #[cfg(not(feature = "tls"))]
@@ -175,7 +141,7 @@ fn start_server(
         .build()
         .unwrap();
 
-    rt.spawn(start_server);
+    rt.spawn(start_server.map_err(|e| error!("Http Server Error: {}", e)));
     Ok(rt)
 }
 
