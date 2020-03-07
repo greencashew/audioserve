@@ -410,7 +410,7 @@ pub fn download_folder(base_path: &'static Path, folder_path: PathBuf) -> Respon
                     .map(std::borrow::ToOwned::to_owned)
                     .unwrap_or_else(|| "audio".into());
                 download_name.push_str(".tar");
-                let f = blocking(|| list_dir_files_only(&base_path, &folder_path))
+                let f = blocking(move || list_dir_files_only(&base_path, &folder_path))
                     .map_ok(move |res| match res {
                         Ok(folder) => {
                             let total_len: u64;
@@ -448,10 +448,10 @@ pub fn download_folder(base_path: &'static Path, folder_path: PathBuf) -> Respon
                         Error::new_with_cause(e)
                     });
 
-                Box::new(f)
+                Box::pin(f)
             }
         });
-    Box::new(f)
+    Box::pin(f)
 }
 
 fn json_response<T: serde::Serialize>(data: &T) -> Response {

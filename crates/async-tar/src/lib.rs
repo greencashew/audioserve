@@ -36,7 +36,7 @@ fn cut_path<P: AsRef<OsStr>>(p: P, max_len: usize) -> OsString {
     }
 }
 
-type PinnedFuture<T> =  Pin<Box<dyn Future<Output = T>>>;
+type PinnedFuture<T> =  Pin<Box<dyn Future<Output = T>+Send+Sync>>;
 
 #[allow(clippy::large_enum_variant)] // not a problem as there is only one instance of state
 enum TarState {
@@ -87,7 +87,7 @@ pub fn calc_size<S: IntoIterator<Item = u64>>(sizes: S) -> u64 {
 ///
 pub struct TarStream<P> {
     state: Option<TarState>,
-    iter: Box<dyn Iterator<Item = P> + Send>,
+    iter: Box<dyn Iterator<Item = P> + Send + Sync>,
     position: usize,
     buf: [u8; BUFFER_LENGTH],
     base_dir: Option<PathBuf>,
@@ -140,7 +140,7 @@ impl<P: AsRef<Path> + Send> TarStream<P> {
     ///
     pub fn tar_iter<I>(iter: I) -> Self
     where
-        I: Iterator<Item = P> + Send + 'static,
+        I: Iterator<Item = P> + Send + Sync + 'static,
     {
         TarStream {
             state: Some(TarState::BeforeNext),
@@ -153,7 +153,7 @@ impl<P: AsRef<Path> + Send> TarStream<P> {
 
     pub fn tar_iter_rel<I, B: AsRef<Path>>(iter: I, base_dir: B) -> Self
     where
-        I: Iterator<Item = P> + Send + 'static,
+        I: Iterator<Item = P> + Send + Sync + 'static,
     {
         TarStream {
             state: Some(TarState::BeforeNext),
