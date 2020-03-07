@@ -29,15 +29,15 @@ pub trait Authenticator: Send + Sync {
 #[derive(Clone)]
 pub struct SharedSecretAuthenticator {
     shared_secret: String,
-    my_secret: Vec<u8>,
+    server_secret: Vec<u8>,
     token_validity_hours: u32,
 }
 
 impl SharedSecretAuthenticator {
-    pub fn new(shared_secret: String, my_secret: Vec<u8>, token_validity_hours: u32) -> Self {
+    pub fn new(shared_secret: String, server_secret: Vec<u8>, token_validity_hours: u32) -> Self {
         SharedSecretAuthenticator {
             shared_secret,
-            my_secret,
+            server_secret,
             token_validity_hours,
         }
     }
@@ -133,12 +133,12 @@ impl SharedSecretAuthenticator {
         false
     }
     fn new_auth_token(&self) -> String {
-        Token::new(self.token_validity_hours, &self.my_secret).into()
+        Token::new(self.token_validity_hours, &self.server_secret).into()
     }
 
     fn token_ok(&self, token: &str) -> bool {
         match token.parse::<Token>() {
-            Ok(token) => token.is_valid(&self.my_secret),
+            Ok(token) => token.is_valid(&self.server_secret),
             Err(e) => {
                 warn!("Invalid token: {}", e);
                 false

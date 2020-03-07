@@ -44,7 +44,7 @@ where
     Ok(key)
 }
 
-fn gen_my_secret<P: AsRef<Path>>(file: P) -> Result<Vec<u8>, io::Error> {
+fn generate_server_secret<P: AsRef<Path>>(file: P) -> Result<Vec<u8>, io::Error> {
     let file = file.as_ref();
     if file.exists() {
         let mut v = vec![];
@@ -78,18 +78,20 @@ fn gen_my_secret<P: AsRef<Path>>(file: P) -> Result<Vec<u8>, io::Error> {
             f = File::create(file)?
         }
         f.write_all(&random)?;
-        Ok(random.iter().cloned().collect())
+        Ok(random.to_vec())
     }
 }
 
-fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<dyn std::error::Error>> {
+fn start_server(
+    server_secret: Vec<u8>,
+) -> Result<tokio::runtime::Runtime, Box<dyn std::error::Error>> {
     let cfg = get_config();
     let svc = FileSendService {
         authenticator: get_config().shared_secret.as_ref().map(
             |secret| -> Arc<Box<dyn services::auth::Authenticator<Credentials = ()>>> {
                 Arc::new(Box::new(SharedSecretAuthenticator::new(
                     secret.clone(),
-                    my_secret,
+                    server_secret,
                     cfg.token_validity_hours,
                 )))
             },
@@ -101,17 +103,14 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<dyn s
         },
     };
     let addr = cfg.listen;
-    let f = async move {
-        let incomming_connections = AddrIncoming::bind(&addr)?;
+    let start_server = async move {
+        let incoming_connections = AddrIncoming::bind(&addr)?;
 
         let server: Pin<Box<dyn Future<Output = Result<(), hyper::Error>> + Send>> =
             match get_config().ssl.as_ref() {
                 None => {
-                    let server = HttpServer::builder(incomming_connections).serve(make_service_fn(
-                        move |_| {
-                            let s: Result<_, error::Error> = Ok(svc.clone());
-                            future::ready(s)
-                        },
+                    let server = HttpServer::builder(incoming_connections).serve(make_service_fn(
+                        move |_| future::ok::<_, error::Error>(svc.clone()),
                     ));
                     info!("Server listening on {}", &addr);
                     Box::pin(server)
@@ -130,7 +129,7 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<dyn s
                         let tls_cx = native_tls::TlsAcceptor::builder(private_key).build()?;
                         let tls_cx = tokio_tls::TlsAcceptor::from(tls_cx);
 
-                        let incoming = incomming_connections
+                        let incoming = incoming_connections
                             .and_then(move |socket| {
                                 tls_cx
                                     .accept(socket)
@@ -165,7 +164,6 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<dyn s
                 }
             };
 
-        //let server = server.map_err(|e| error!("Cannot start HTTP server due to error {}", e));
         server.await
     };
 
@@ -177,8 +175,7 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<dyn s
         .build()
         .unwrap();
 
-    rt.spawn(f);
-
+    rt.spawn(start_server);
     Ok(rt)
 }
 
@@ -189,12 +186,9 @@ fn main() {
             warn!("Audioserve is running as root! Not recommended.")
         }
     }
-    match init_config() {
-        Err(e) => {
-            writeln!(&mut io::stderr(), "Config/Arguments error: {}", e).unwrap();
-            process::exit(1)
-        }
-        Ok(c) => c,
+    if let Err(e) = init_config() {
+        eprintln!("Config/Arguments error: {}", e);
+        process::exit(1)
     };
     env_logger::init();
     debug!("Started with following config {:?}", get_config());
@@ -214,7 +208,7 @@ fn main() {
             )
         }
     }
-    let my_secret = match gen_my_secret(&get_config().secret_file) {
+    let server_secret = match generate_server_secret(&get_config().secret_file) {
         Ok(s) => s,
         Err(e) => {
             error!("Error creating/reading secret: {}", e);
@@ -222,7 +216,7 @@ fn main() {
         }
     };
 
-    let runtime = match start_server(my_secret) {
+    let runtime = match start_server(server_secret) {
         Ok(rt) => rt,
         Err(e) => {
             error!("Error starting server: {}", e);
@@ -258,8 +252,8 @@ fn main() {
 
     #[cfg(not(unix))]
     {
-        // TODO: Does it work?
-        runtime.block_on(future::pending());
+        let mut runtime = runtime;
+        runtime.block_on(future::pending::<()>());
     }
     info!("Server finished");
 }
