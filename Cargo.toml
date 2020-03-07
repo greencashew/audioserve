@@ -1,6 +1,6 @@
 [package]
 name = "audioserve"
-version = "0.11.3"
+version = "0.12.0"
 authors = ["Ivan <ivan.zderadicka@gmail.com>"]
 edition = "2018"
 
@@ -63,7 +63,6 @@ nix = "0.17"
 
 [features]
 default = ["tls", "symlinks","search-cache", "folder-download", "shared-positions"]
-#default = ["tls", "symlinks", "search-cache", "folder-download", "shared-positions"]
 tls=["tokio-tls", "native-tls"]
 symlinks=["cachedirtree/symlinks"]
 search-cache=["cachedirtree"]
