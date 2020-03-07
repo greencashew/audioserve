@@ -107,13 +107,13 @@ pub fn position_service(req: Request<Body>) -> ResponseFuture {
                         }
                     };
 
-                    Box::new(future::ok(None))
+                    Box::pin(future::ok(None))
                 }
                 Msg::GenericQuery { group } => {
                     let last = CACHE.get_last(group);
                     let res = Reply { folder: None, last };
 
-                    Box::new(future::ok(Some(ws::Message::text(
+                    Box::pin(future::ok(Some(ws::Message::text(
                         serde_json::to_string(&res).unwrap(),
                         m.context(),
                     ))))
@@ -128,7 +128,7 @@ pub fn position_service(req: Request<Body>) -> ResponseFuture {
                         folder,
                     };
 
-                    Box::new(future::ok(Some(ws::Message::text(
+                    Box::pin(future::ok(Some(ws::Message::text(
                         serde_json::to_string(&res).unwrap(),
                         m.context(),
                     ))))
@@ -136,12 +136,12 @@ pub fn position_service(req: Request<Body>) -> ResponseFuture {
             },
             Err(e) => {
                 error!("Position message error: {}", e);
-                Box::new(future::ok(None))
+                Box::pin(future::ok(None))
             }
         }
     });
 
-    Box::new(future::ok(res))
+    Box::pin(future::ok(res))
 }
 
 #[cfg(test)]

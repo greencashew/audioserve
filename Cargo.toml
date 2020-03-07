@@ -62,7 +62,7 @@ optional = true
 nix = "0.17"
 
 [features]
-default = ["symlinks","search-cache", "folder-download"]
+default = ["symlinks","search-cache", "folder-download", "shared-positions"]
 #default = ["tls", "symlinks", "search-cache", "folder-download", "shared-positions"]
 tls=["tokio-tls", "native-tls"]
 symlinks=["cachedirtree/symlinks"]
