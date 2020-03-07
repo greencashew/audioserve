@@ -9,7 +9,7 @@ use super::audio_meta::{get_audio_properties, Chapter, MediaInfo};
 use super::transcode::TimeSpan;
 use super::types::*;
 use crate::config::get_config;
-use crate::util::{os_to_string, guess_mime_type};
+use crate::util::{guess_mime_type, os_to_string};
 use regex::Regex;
 
 pub fn list_dir<P: AsRef<Path>, P2: AsRef<Path>>(
@@ -535,5 +535,4 @@ mod tests {
             ms_from_time("02:35:01.1")
         );
     }
-
 }

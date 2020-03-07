@@ -8,13 +8,13 @@ use futures::prelude::*;
 use mime::Mime;
 use std::ffi::OsStr;
 use std::fmt::Debug;
+#[cfg(feature = "transcoding-cache")]
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use tokio::time::delay_for;
 use tokio::process::{ChildStdout, Command};
-#[cfg(feature = "transcoding-cache")]
-use std::pin::Pin;
+use tokio::time::delay_for;
 
 #[cfg(feature = "transcoding-cache")]
 pub mod cache;
@@ -192,7 +192,7 @@ pub struct Transcoder {
 
 #[cfg(feature = "transcoding-cache")]
 type TranscodedStream =
-    Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>,std::io::Error>> + Send + Sync + 'static>>;
+    Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>, std::io::Error>> + Send + Sync + 'static>>;
 #[cfg(feature = "transcoding-cache")]
 type TranscodedFuture = Pin<Box<dyn Future<Output = Result<TranscodedStream, Error>> + Send>>;
 
@@ -306,12 +306,13 @@ impl Transcoder {
         counter: super::Counter,
         _quality: QualityLevel,
     ) -> impl Future<Output = Result<ChunkStream<ChildStdout>, Error>> {
-        future::ready(self.transcode_inner(file, seek, span, counter).map(
-            |(stream, f)| {
-                tokio::spawn(f);
-                stream
-            },
-        ))
+        future::ready(
+            self.transcode_inner(file, seek, span, counter)
+                .map(|(stream, f)| {
+                    tokio::spawn(f);
+                    stream
+                }),
+        )
     }
 
     #[cfg(feature = "transcoding-cache")]
@@ -349,15 +350,17 @@ impl Transcoder {
         let fut = cache.add_async(key).then(move |res| match res {
             Err(e) => {
                 warn!("Cannot create cache entry: {}", e);
-                future::ready(self.transcode_inner(file, seek, span, counter)
-                    .map(|(stream, f)| {
-                        tokio::spawn(f);
+                future::ready(
+                    self.transcode_inner(file, seek, span, counter)
+                        .map(|(stream, f)| {
+                            tokio::spawn(f);
 
-                        Box::pin(stream) as TranscodedStream
-                    }))
+                            Box::pin(stream) as TranscodedStream
+                        }),
+                )
             }
-            Ok((cache_file, cache_finish)) => {
-                future::ready(self.transcode_inner(file, seek, span, counter)
+            Ok((cache_file, cache_finish)) => future::ready(
+                self.transcode_inner(file, seek, span, counter)
                     .map(|(mut stream, f)| {
                         tokio::spawn(f.then(|res| {
                             fn box_me<I, E, F: Future<Output = Result<I, E>> + 'static + Send>(
@@ -395,26 +398,23 @@ impl Transcoder {
                                 ),
                             }
                         }));
-                        let cache_sink =
-                            tokio_util::codec::FramedWrite::new(cache_file, self::vec_codec::VecEncoder);
+                        let cache_sink = tokio_util::codec::FramedWrite::new(
+                            cache_file,
+                            self::vec_codec::VecEncoder,
+                        );
                         let (tx, rx) = mpsc::channel(64);
                         let mut tx = cache_sink
                             .fanout(tx.sink_map_err(|e| io::Error::new(io::ErrorKind::Other, e)));
                         let f = async move {
                             let done = tx.send_all(&mut stream).await;
                             if let Err(e) = done {
-                                    warn!("Error in channel: {}", e)
-                                }
+                                warn!("Error in channel: {}", e)
+                            }
                         };
                         tokio::spawn(f);
-                        Box::pin(rx
-                            .map(|i| {
-                            Ok(i)
-                        }
-                        )
-                            ) as TranscodedStream
-                    })
-                )}
+                        Box::pin(rx.map(|i| Ok(i))) as TranscodedStream
+                    }),
+            ),
         });
         Box::pin(fut)
     }
@@ -425,7 +425,13 @@ impl Transcoder {
         seek: Option<f32>,
         span: Option<TimeSpan>,
         counter: super::Counter,
-    ) -> Result<(ChunkStream<ChildStdout>, impl Future<Output = Result<(),()>>), Error> {
+    ) -> Result<
+        (
+            ChunkStream<ChildStdout>,
+            impl Future<Output = Result<(), ()>>,
+        ),
+        Error,
+    > {
         let mut cmd = match (&file, &self.quality) {
             (_, TranscodingFormat::Remux) => {
                 self.build_remux_command(file.as_ref(), seek, span, false)
@@ -557,7 +563,7 @@ mod tests {
     use super::super::audio_meta::{get_audio_properties, MediaInfo};
     use super::*;
     use std::env::temp_dir;
-    use std::fs::{remove_file};
+    use std::fs::remove_file;
     use std::path::Path;
 
     fn dummy_transcode<P: AsRef<Path>, R: AsRef<Path>>(
@@ -577,33 +583,36 @@ mod tests {
         println!("Command is {:?}", cmd);
 
         let f = async {
-
             let mut child = cmd.spawn().expect("Cannot spawn subprocess");
 
-        if child.stdout.is_some() {
-            let mut file = tokio::fs::File::create(&out_file).await.expect("Cannot create output file");
-            let mut out = child.stdout.take().unwrap();
-            tokio::io::copy(&mut out, &mut file).await.expect("file cope failed");
-            // loop {
-            //     match out.read(&mut buf) {
-            //         Ok(n) => {
-            //             if n == 0 {
-            //                 break;
-            //             } else {
-            //                 file.write_all(&mut buf).expect("Write to file error")
-            //             }
-            //         }
-            //         Err(e) => panic!("stdout read error {:?}", e),
-            //     }
-            // }
-        }
-        child.await
+            if child.stdout.is_some() {
+                let mut file = tokio::fs::File::create(&out_file)
+                    .await
+                    .expect("Cannot create output file");
+                let mut out = child.stdout.take().unwrap();
+                tokio::io::copy(&mut out, &mut file)
+                    .await
+                    .expect("file cope failed");
+                // loop {
+                //     match out.read(&mut buf) {
+                //         Ok(n) => {
+                //             if n == 0 {
+                //                 break;
+                //             } else {
+                //                 file.write_all(&mut buf).expect("Write to file error")
+                //             }
+                //         }
+                //         Err(e) => panic!("stdout read error {:?}", e),
+                //     }
+                // }
+            }
+            child.await
         };
         let mut rt = tokio::runtime::Runtime::new().expect("cannot create runtime");
         let status = rt.block_on(f).expect("cannot get status");
         assert!(status.success());
         assert!(out_file.exists());
-        
+
         //TODO: for some reasons sometimes cannot get meta - but file is OK
         let meta = get_audio_properties(&out_file).expect("Cannot get audio file meta");
         let audio_len = if copy_file.is_some() { 1 } else { 2 };
@@ -663,5 +672,4 @@ mod tests {
             }),
         );
     }
-
 }

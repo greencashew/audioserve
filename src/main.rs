@@ -10,7 +10,7 @@ extern crate lazy_static;
 use config::{get_config, init_config};
 use futures::prelude::*;
 use hyper::server::conn::AddrIncoming;
-use hyper::{Server as HttpServer, service::make_service_fn};
+use hyper::{service::make_service_fn, Server as HttpServer};
 use ring::rand::{SecureRandom, SystemRandom};
 use services::auth::SharedSecretAuthenticator;
 use services::search::Search;
@@ -18,10 +18,10 @@ use services::{FileSendService, TranscodingDetails};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::pin::Pin;
 use std::process;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-use std::pin::Pin;
 
 #[cfg(feature = "tls")]
 use native_tls::Identity;
@@ -104,71 +104,70 @@ fn start_server(my_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Box<dyn s
     let f = async move {
         let incomming_connections = AddrIncoming::bind(&addr)?;
 
-    let server: Pin<Box<dyn Future<Output = Result<(), hyper::Error>> + Send>> =
-        match get_config().ssl.as_ref() {
-            None => {
-                let server = HttpServer::builder(incomming_connections).serve(
-                    
-                    make_service_fn(move |_| {
-                    let s: Result<_, error::Error> = Ok(svc.clone());
-                    future::ready(s)
-                }));
-                info!("Server listening on {}", &addr);
-                Box::pin(server)
-            }
-            Some(ssl) => {
-                #[cfg(feature = "tls")]
-                {
-                    use futures::Stream;
-                    let private_key = match load_private_key(&ssl.key_file, &ssl.key_password) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!("Error loading SSL/TLS private key: {}", e);
-                            return Err(Box::new(e));
-                        }
-                    };
-                    let tls_cx = native_tls::TlsAcceptor::builder(private_key).build()?;
-                    let tls_cx = tokio_tls::TlsAcceptor::from(tls_cx);
-
-                    let incoming = incomming_connections
-                        .and_then(move |socket| {
-                            tls_cx
-                                .accept(socket)
-                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-                        })
-                        // we need to skip TLS errors, so we can accept next connection, otherwise
-                        // stream will end and server will stop listening
-                        .then(|res| match res {
-                            Ok(conn) => Ok::<_, io::Error>(Some(conn)),
-                            Err(e) => {
-                                error!("TLS error: {}", e);
-                                Ok(None)
-                            }
-                        })
-                        .filter_map(|x| x);
-
-                    let server = HttpServer::builder(incoming).serve(move || {
-                        let s: Result<_, error::Error> = Ok(svc.clone());
-                        s
-                    });
-                    info!("Server Listening on {} with TLS", &addr);
+        let server: Pin<Box<dyn Future<Output = Result<(), hyper::Error>> + Send>> =
+            match get_config().ssl.as_ref() {
+                None => {
+                    let server = HttpServer::builder(incomming_connections).serve(make_service_fn(
+                        move |_| {
+                            let s: Result<_, error::Error> = Ok(svc.clone());
+                            future::ready(s)
+                        },
+                    ));
+                    info!("Server listening on {}", &addr);
                     Box::pin(server)
                 }
+                Some(ssl) => {
+                    #[cfg(feature = "tls")]
+                    {
+                        use futures::Stream;
+                        let private_key = match load_private_key(&ssl.key_file, &ssl.key_password) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!("Error loading SSL/TLS private key: {}", e);
+                                return Err(Box::new(e));
+                            }
+                        };
+                        let tls_cx = native_tls::TlsAcceptor::builder(private_key).build()?;
+                        let tls_cx = tokio_tls::TlsAcceptor::from(tls_cx);
 
-                #[cfg(not(feature = "tls"))]
-                {
-                    panic!(
-                        "TLS is not compiled - build with default features {:?}",
-                        ssl
-                    )
+                        let incoming = incomming_connections
+                            .and_then(move |socket| {
+                                tls_cx
+                                    .accept(socket)
+                                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                            })
+                            // we need to skip TLS errors, so we can accept next connection, otherwise
+                            // stream will end and server will stop listening
+                            .then(|res| match res {
+                                Ok(conn) => Ok::<_, io::Error>(Some(conn)),
+                                Err(e) => {
+                                    error!("TLS error: {}", e);
+                                    Ok(None)
+                                }
+                            })
+                            .filter_map(|x| x);
+
+                        let server = HttpServer::builder(incoming).serve(move || {
+                            let s: Result<_, error::Error> = Ok(svc.clone());
+                            s
+                        });
+                        info!("Server Listening on {} with TLS", &addr);
+                        Box::pin(server)
+                    }
+
+                    #[cfg(not(feature = "tls"))]
+                    {
+                        panic!(
+                            "TLS is not compiled - build with default features {:?}",
+                            ssl
+                        )
+                    }
                 }
-            }
-        };
+            };
 
-     //let server = server.map_err(|e| error!("Cannot start HTTP server due to error {}", e));
-     server.await
+        //let server = server.map_err(|e| error!("Cannot start HTTP server due to error {}", e));
+        server.await
     };
-    
 
     let rt = tokio::runtime::Builder::new()
         .threaded_scheduler()
@@ -243,7 +242,7 @@ fn main() {
             Ok(sig) => info!("Terminating by signal {}", sig),
             Err(e) => error!("Signal wait error: {}", e),
         }
-        //TODO - rather try async signals and Server::with_shutdown 
+        //TODO - rather try async signals and Server::with_shutdown
         runtime.shutdown_timeout(std::time::Duration::from_millis(300));
 
         #[cfg(feature = "transcoding-cache")]

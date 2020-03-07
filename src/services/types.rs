@@ -1,6 +1,6 @@
 use super::transcode::{QualityLevel, TranscodingFormat};
 use crate::config::get_config;
-use crate::util::{os_to_string, guess_mime_type};
+use crate::util::{guess_mime_type, os_to_string};
 use mime::Mime;
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};

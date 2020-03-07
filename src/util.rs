@@ -1,11 +1,11 @@
 use headers::{Header, HeaderName, HeaderValue};
 use hyper::http::response::Builder;
+use mime_guess::{self, Mime};
 use std::cmp::{max, min};
 use std::ops::{Bound, RangeBounds};
 use std::path::Path;
-use mime_guess::{self, Mime};
 
-pub fn guess_mime_type<P:AsRef<Path>>(path:P) -> Mime {
+pub fn guess_mime_type<P: AsRef<Path>>(path: P) -> Mime {
     mime_guess::from_path(path).first_or_octet_stream()
 }
 

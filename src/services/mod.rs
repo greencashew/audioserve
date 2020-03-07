@@ -19,11 +19,11 @@ use percent_encoding::percent_decode;
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-use url::form_urlencoded;
 use std::task::Poll;
-use std::pin::Pin;
+use url::form_urlencoded;
 
 pub mod audio_folder;
 pub mod audio_meta;
@@ -83,10 +83,11 @@ fn add_cors_headers(
     }
 }
 
+#[allow(clippy::type_complexity)]
 impl<C: 'static> Service<Request<Body>> for FileSendService<C> {
     type Response = Response<Body>;
     type Error = crate::error::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response,  Self::Error>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -161,8 +162,8 @@ impl<C> FileSendService<C> {
 
                     {
                         let matches = COLLECTION_NUMBER_RE.captures(&path);
-                        if matches.is_some() {
-                            let cnum = matches.unwrap().get(1).unwrap();
+                        if let Some(matches) = matches {
+                            let cnum = matches.get(1).unwrap();
                             // match gives us char position it's safe to slice
                             new_path = Some((&path[cnum.end()..]).to_string());
                             // and cnum is guarateed to contain digits only
@@ -176,8 +177,8 @@ impl<C> FileSendService<C> {
                             colllection_index = cnum;
                         }
                     }
-                    if new_path.is_some() {
-                        path = new_path.unwrap();
+                    if let Some(p) = new_path {
+                        path = p;
                     }
                     let base_dir = &get_config().base_dirs[colllection_index];
                     let ord = params

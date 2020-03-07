@@ -57,7 +57,6 @@ mod libavformat {
             }
         }
     }
-
 }
 
 pub fn get_audio_properties(audio_file_name: &Path) -> Result<impl MediaInfo, Error> {

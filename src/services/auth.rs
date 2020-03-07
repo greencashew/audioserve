@@ -7,13 +7,16 @@ use headers::authorization::Bearer;
 use headers::{Authorization, ContentLength, ContentType, Cookie, HeaderMapExt};
 use hyper::header::SET_COOKIE;
 use hyper::{Body, Method, Request, Response, StatusCode};
-use ring::{digest::{digest, SHA256}, hmac};
 use ring::rand::{SecureRandom, SystemRandom};
+use ring::{
+    digest::{digest, SHA256},
+    hmac,
+};
 use std::borrow;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::form_urlencoded;
-use std::pin::Pin;
 
 type AuthResult<T> = Result<(Request<Body>, T), Response<Body>>;
 type AuthFuture<T> = Pin<Box<dyn Future<Output = Result<AuthResult<T>, Error>> + Send>>;
@@ -79,9 +82,7 @@ impl Authenticator for SharedSecretAuthenticator {
                                     .as_str(),
                                 );
 
-                                Err(resp
-                                    .body(token.into())
-                                    .unwrap())
+                                Err(resp.body(token.into()).unwrap())
                             } else {
                                 deny()
                             }

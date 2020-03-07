@@ -8,15 +8,15 @@ use super::types::*;
 use super::Counter;
 use crate::config::get_config;
 use crate::error::Error;
-use crate::util::{checked_dec, into_range_bounds, to_satisfiable_range, ResponseBuilderExt, guess_mime_type};
+use crate::util::{
+    checked_dec, guess_mime_type, into_range_bounds, to_satisfiable_range, ResponseBuilderExt,
+};
 use futures::prelude::*;
 use futures::{future, ready, Stream};
 use headers::{AcceptRanges, CacheControl, ContentLength, ContentRange, ContentType, LastModified};
 #[cfg(feature = "folder-download")]
 use hyper::header::CONTENT_DISPOSITION;
 use hyper::{Body, Response as HyperResponse, StatusCode};
-use mime;
-use serde_json;
 use std::collections::Bound;
 use std::ffi::OsStr;
 use std::io::{self, SeekFrom};
@@ -37,7 +37,7 @@ type Response = HyperResponse<Body>;
 pub type ResponseFuture = Pin<Box<dyn Future<Output = Result<Response, Error>> + Send>>;
 
 pub fn short_response(status: StatusCode, msg: &'static str) -> Response {
-    let mut res =  HyperResponse::builder();
+    let mut res = HyperResponse::builder();
     res = res.status(status);
     res.typed_header(ContentLength(msg.len() as u64));
     res.body(msg.into()).unwrap()
@@ -182,7 +182,8 @@ fn serve_file_transcoded(
                 let mut resp = HyperResponse::builder();
                 resp.typed_header(ContentType::from(mime));
                 resp = resp.header("X-Transcode", params.as_bytes());
-                let resp = resp.body(Body::wrap_stream(stream.map_err(Error::new_with_cause)))
+                let resp = resp
+                    .body(Body::wrap_stream(stream.map_err(Error::new_with_cause)))
                     .unwrap();
 
                 future::ok(resp)
@@ -204,7 +205,7 @@ pub struct ChunkStream<T> {
     buf: [u8; 8 * 1024],
 }
 
-impl<T: AsyncRead+Unpin> Stream for ChunkStream<T> {
+impl<T: AsyncRead + Unpin> Stream for ChunkStream<T> {
     type Item = Result<Vec<u8>, io::Error>;
 
     fn poll_next(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
@@ -219,7 +220,7 @@ impl<T: AsyncRead+Unpin> Stream for ChunkStream<T> {
         let s = &mut self.get_mut();
         match ready! {
             {
-            
+
             let pinned_stream = Pin::new(s.src.as_mut().unwrap());
             pinned_stream.poll_read(ctx, &mut s.buf[..])
             }
@@ -299,9 +300,7 @@ async fn serve_opened_file(
     let _pos = file.seek(SeekFrom::Start(start)).await;
     let stream = ChunkStream::new_with_limit(file, end - start + 1);
     resp.typed_header(ContentLength(end - start + 1));
-    Ok(resp
-        .body(Body::wrap_stream(stream))
-        .unwrap())
+    Ok(resp.body(Body::wrap_stream(stream)).unwrap())
 }
 
 fn serve_file_from_fs(
@@ -378,7 +377,7 @@ pub fn get_folder(
     ordering: FoldersOrdering,
 ) -> ResponseFuture {
     Box::pin(
-        blocking(move|| list_dir(&base_path, &folder_path, ordering))
+        blocking(move || list_dir(&base_path, &folder_path, ordering))
             .map_ok(|res| match res {
                 Ok(folder) => json_response(&folder),
                 Err(_) => short_response(StatusCode::NOT_FOUND, NOT_FOUND_MESSAGE),
@@ -460,8 +459,7 @@ fn json_response<T: serde::Serialize>(data: &T) -> Response {
     let mut res = HyperResponse::builder();
     res.typed_header(ContentType::json());
     res.typed_header(ContentLength(json.len() as u64));
-    res.body(json.into())
-        .unwrap()
+    res.body(json.into()).unwrap()
 }
 
 const UKNOWN_NAME: &str = "unknown";
