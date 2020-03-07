@@ -37,10 +37,10 @@ type Response = HyperResponse<Body>;
 pub type ResponseFuture = Pin<Box<dyn Future<Output = Result<Response, Error>> + Send>>;
 
 pub fn short_response(status: StatusCode, msg: &'static str) -> Response {
-    let mut res = HyperResponse::builder();
-    res = res.status(status);
-    res.typed_header(ContentLength(msg.len() as u64));
-    res.body(msg.into()).unwrap()
+    HyperResponse::builder()
+        .status(status)
+        .typed_header(ContentLength(msg.len() as u64))
+        .body(msg.into()).unwrap()
 }
 
 pub fn short_response_boxed(status: StatusCode, msg: &'static str) -> ResponseFuture {
@@ -179,14 +179,15 @@ fn serve_file_transcoded(
         .transcode(full_path, seek, span, counter.clone(), transcoding_quality)
         .then(move |res| match res {
             Ok(stream) => {
-                let mut resp = HyperResponse::builder();
-                resp.typed_header(ContentType::from(mime));
-                resp = resp.header("X-Transcode", params.as_bytes());
-                let resp = resp
+                future::ok(
+                HyperResponse::builder()
+                    .typed_header(ContentType::from(mime))
+                    .header("X-Transcode", params.as_bytes())
                     .body(Body::wrap_stream(stream.map_err(Error::new_with_cause)))
-                    .unwrap();
+                    .unwrap()
+                )
 
-                future::ok(resp)
+                
             }
             Err(e) => {
                 error!("Cannot create transcoded stream, error: {}", e);
@@ -266,24 +267,23 @@ async fn serve_opened_file(
         warn!("File has zero size ")
     }
     let last_modified = meta.modified().ok();
-    let mut resp = HyperResponse::builder();
-    resp.typed_header(ContentType::from(mime));
+    let mut resp = HyperResponse::builder()
+        .typed_header(ContentType::from(mime));
     if let Some(age) = caching {
         let cache = CacheControl::new()
             .with_public()
             .with_max_age(std::time::Duration::from_secs(u64::from(age)));
-        resp.typed_header(cache);
+        resp = resp.typed_header(cache);
         if let Some(last_modified) = last_modified {
-            resp.typed_header(LastModified::from(last_modified));
+            resp = resp.typed_header(LastModified::from(last_modified));
         }
     }
 
     let (start, end) = match range {
         Some(range) => match to_satisfiable_range(range, file_len) {
             Some(l) => {
-                resp = resp.status(StatusCode::PARTIAL_CONTENT);
-                let h = ContentRange::bytes(into_range_bounds(l), Some(file_len)).unwrap();
-                resp.typed_header(h);
+                resp = resp.status(StatusCode::PARTIAL_CONTENT)
+                .typed_header(ContentRange::bytes(into_range_bounds(l), Some(file_len)).unwrap());
                 l
             }
             None => {
@@ -292,15 +292,16 @@ async fn serve_opened_file(
             }
         },
         None => {
-            resp = resp.status(StatusCode::OK);
-            resp.typed_header(AcceptRanges::bytes());
+            resp = resp.status(StatusCode::OK)
+            .typed_header(AcceptRanges::bytes());
             (0, checked_dec(file_len))
         }
     };
     let _pos = file.seek(SeekFrom::Start(start)).await;
     let stream = ChunkStream::new_with_limit(file, end - start + 1);
-    resp.typed_header(ContentLength(end - start + 1));
-    Ok(resp.body(Body::wrap_stream(stream)).unwrap())
+    let resp = resp.typed_header(ContentLength(end - start + 1))
+        .body(Body::wrap_stream(stream)).unwrap();
+    Ok(resp)
 }
 
 fn serve_file_from_fs(
@@ -420,11 +421,6 @@ pub fn download_folder(base_path: &'static Path, folder_path: PathBuf) -> Respon
                             debug!("Total len of folder is {}", total_len);
                             let files = folder.into_iter().map(|i| i.0);
                             let tar_stream = async_tar::TarStream::tar_iter(files);
-                            let mut resp = HyperResponse::builder();
-                            resp.typed_header(ContentType::from(
-                                "application/x-tar".parse::<mime::Mime>().unwrap(),
-                            ));
-                            resp.typed_header(ContentLength(total_len));
                             // let disposition = ContentDisposition {
                             //     disposition: DispositionType::Attachment,
                             //     parameters: vec![DispositionParam::Filename(
@@ -434,8 +430,13 @@ pub fn download_folder(base_path: &'static Path, folder_path: PathBuf) -> Respon
                             //     )],
                             // };
                             let disposition = format!("attachment; filename=\"{}\"", download_name);
-                            resp.header(CONTENT_DISPOSITION, disposition.as_bytes());
-                            resp.body(Body::wrap_stream(tar_stream)).unwrap()
+                            HyperResponse::builder()
+                                .typed_header(ContentType::from(
+                                "application/x-tar".parse::<mime::Mime>().unwrap(),
+                                ))
+                                .typed_header(ContentLength(total_len))
+                                .header(CONTENT_DISPOSITION, disposition.as_bytes())
+                                .body(Body::wrap_stream(tar_stream)).unwrap()
                         }
                         Err(e) => {
                             error!("Cannot list download dir: {}", e);
@@ -456,10 +457,10 @@ pub fn download_folder(base_path: &'static Path, folder_path: PathBuf) -> Respon
 fn json_response<T: serde::Serialize>(data: &T) -> Response {
     let json = serde_json::to_string(data).expect("Serialization error");
 
-    let mut res = HyperResponse::builder();
-    res.typed_header(ContentType::json());
-    res.typed_header(ContentLength(json.len() as u64));
-    res.body(json.into()).unwrap()
+    HyperResponse::builder()
+    .typed_header(ContentType::json())
+    .typed_header(ContentLength(json.len() as u64))
+    .body(json.into()).unwrap()
 }
 
 const UKNOWN_NAME: &str = "unknown";

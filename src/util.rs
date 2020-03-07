@@ -1,4 +1,4 @@
-use headers::{Header, HeaderName, HeaderValue};
+use headers::{Header,HeaderMapExt};
 use hyper::http::response::Builder;
 use mime_guess::{self, Mime};
 use std::cmp::{max, min};
@@ -73,31 +73,13 @@ pub fn header2header<H1: Header, H2: Header>(i: H1) -> Result<impl Header, heade
     H2::decode(&mut v.iter())
 }
 
-struct HeadersExtender<'a, 'b> {
-    builder: &'a mut Builder,
-    name: &'b HeaderName,
-}
-
-impl<'a, 'b> Extend<HeaderValue> for HeadersExtender<'a, 'b> {
-    fn extend<I: IntoIterator<Item = HeaderValue>>(&mut self, iter: I) {
-        let headers = self.builder.headers_mut().unwrap(); // TODO is it always safe to unwrap()?
-        for v in iter.into_iter() {
-            headers.insert(self.name, v);
-        }
-    }
-}
-
 pub trait ResponseBuilderExt {
-    fn typed_header<H: Header>(&mut self, header: H) -> &mut Builder;
+    fn typed_header<H: Header>(self, header: H) -> Self;
 }
 
 impl ResponseBuilderExt for Builder {
-    fn typed_header<H: Header>(&mut self, header: H) -> &mut Builder {
-        let mut extender = HeadersExtender {
-            builder: self,
-            name: H::name(),
-        };
-        header.encode(&mut extender);
+    fn typed_header<H: Header>(mut self, header: H) -> Builder {
+        self.headers_mut().map(|h| h.typed_insert(header));
         self
     }
 }

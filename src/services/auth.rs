@@ -68,10 +68,10 @@ impl Authenticator for SharedSecretAuthenticator {
                             if auth.auth_token_ok(secret) {
                                 debug!("Authentication success");
                                 let token = auth.new_auth_token();
-                                let mut resp = Response::builder();
-                                resp.typed_header(ContentType::text());
-                                resp.typed_header(ContentLength(token.len() as u64));
-                                resp = resp.header(
+                                let resp = Response::builder()
+                                .typed_header(ContentType::text())
+                                .typed_header(ContentLength(token.len() as u64))
+                                .header(
                                     SET_COOKIE,
                                     format!(
                                         "{}={}; Max-Age={}",
