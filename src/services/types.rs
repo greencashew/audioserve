@@ -222,7 +222,7 @@ pub fn is_cover<P: AsRef<Path>>(path: P) -> bool {
     mime.type_() == "image" && has_subtype(&mime, COVERS)
 }
 
-const DESCRIPTIONS: &[&str] = &["html", "plain", "x-markdown"];
+const DESCRIPTIONS: &[&str] = &["html", "plain", "markdown"];
 
 pub fn is_description<P: AsRef<Path>>(path: P) -> bool {
     let mime = guess_mime_type(path);

@@ -13,6 +13,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::time::delay_for;
 use tokio::process::{ChildStdout, Command};
+#[cfg(feature = "transcoding-cache")]
 use std::pin::Pin;
 
 #[cfg(feature = "transcoding-cache")]
@@ -556,9 +557,7 @@ mod tests {
     use super::super::audio_meta::{get_audio_properties, MediaInfo};
     use super::*;
     use std::env::temp_dir;
-    use std::fs::{remove_file, File};
-    use std::io::{Read, Write};
-    use tokio::io::{AsyncReadExt};
+    use std::fs::{remove_file};
     use std::path::Path;
 
     fn dummy_transcode<P: AsRef<Path>, R: AsRef<Path>>(
@@ -577,31 +576,34 @@ mod tests {
         };
         println!("Command is {:?}", cmd);
 
-        let f = async move {
-            
-        };
-        let mut child = cmd.spawn().expect("Cannot spawn subprocess");
+        let f = async {
 
-        if child.stdout().is_some() {
-            let mut file = File::create(&out_file).expect("Cannot create output file");
-            let mut buf = [0u8; 1024];
-            let mut out = child.stdout().take().unwrap();
-            loop {
-                match out.read(&mut buf) {
-                    Ok(n) => {
-                        if n == 0 {
-                            break;
-                        } else {
-                            file.write_all(&mut buf).expect("Write to file error")
-                        }
-                    }
-                    Err(e) => panic!("stdout read error {:?}", e),
-                }
-            }
+            let mut child = cmd.spawn().expect("Cannot spawn subprocess");
+
+        if child.stdout.is_some() {
+            let mut file = tokio::fs::File::create(&out_file).await.expect("Cannot create output file");
+            let mut out = child.stdout.take().unwrap();
+            tokio::io::copy(&mut out, &mut file).await.expect("file cope failed");
+            // loop {
+            //     match out.read(&mut buf) {
+            //         Ok(n) => {
+            //             if n == 0 {
+            //                 break;
+            //             } else {
+            //                 file.write_all(&mut buf).expect("Write to file error")
+            //             }
+            //         }
+            //         Err(e) => panic!("stdout read error {:?}", e),
+            //     }
+            // }
         }
-        let status = child.wait().expect("cannot get status");
+        child.await
+        };
+        let mut rt = tokio::runtime::Runtime::new().expect("cannot create runtime");
+        let status = rt.block_on(f).expect("cannot get status");
         assert!(status.success());
         assert!(out_file.exists());
+        
         //TODO: for some reasons sometimes cannot get meta - but file is OK
         let meta = get_audio_properties(&out_file).expect("Cannot get audio file meta");
         let audio_len = if copy_file.is_some() { 1 } else { 2 };
