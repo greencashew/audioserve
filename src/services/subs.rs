@@ -27,7 +27,7 @@ use std::task::{Context, Poll};
 use tokio::io::AsyncRead;
 use tokio::task::spawn_blocking as blocking;
 
-pub type ByteRenge = (Bound<u64>, Bound<u64>);
+pub type ByteRange = (Bound<u64>, Bound<u64>);
 
 pub const NOT_FOUND_MESSAGE: &str = "Not Found";
 const SEVER_ERROR_TRANSCODING: &str = "Server error during transcoding process";
@@ -40,7 +40,8 @@ pub fn short_response(status: StatusCode, msg: &'static str) -> Response {
     HyperResponse::builder()
         .status(status)
         .typed_header(ContentLength(msg.len() as u64))
-        .body(msg.into()).unwrap()
+        .body(msg.into())
+        .unwrap()
 }
 
 pub fn short_response_boxed(status: StatusCode, msg: &'static str) -> ResponseFuture {
@@ -52,7 +53,7 @@ fn serve_file_cached_or_transcoded(
     full_path: PathBuf,
     seek: Option<f32>,
     span: Option<TimeSpan>,
-    _range: Option<ByteRenge>,
+    _range: Option<ByteRange>,
     transcoding: super::TranscodingDetails,
     transcoding_quality: QualityLevel,
 ) -> ResponseFuture {
@@ -70,18 +71,18 @@ fn serve_file_cached_or_transcoded(
     full_path: PathBuf,
     seek: Option<f32>,
     span: Option<TimeSpan>,
-    range: Option<ByteRenge>,
+    range: Option<ByteRange>,
     transcoding: super::TranscodingDetails,
     transcoding_quality: QualityLevel,
 ) -> ResponseFuture {
     if get_config().transcoding.cache.disabled {
-        return Box::pin(serve_file_transcoded_checked(
+        return serve_file_transcoded_checked(
             AudioFilePath::Original(full_path),
             seek,
             span,
             transcoding,
             transcoding_quality,
-        ));
+        );
     }
 
     use super::transcode::cache::{cache_key, get_cache};
@@ -145,10 +146,7 @@ fn serve_file_transcoded_checked(
     let running_transcodings: u32 = counter.load(Ordering::SeqCst) as u32;
     if running_transcodings >= transcoding.max_transcodings {
         warn!("Max transcodings reached {}", transcoding.max_transcodings);
-        Box::pin(future::ok(short_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Max transcodings reached",
-        )))
+        short_response_boxed(StatusCode::SERVICE_UNAVAILABLE, "Max transcodings reached")
     } else {
         debug!(
             "Sendig file {:?} transcoded - remaining slots {}/{}",
@@ -178,17 +176,13 @@ fn serve_file_transcoded(
     let fut = transcoder
         .transcode(full_path, seek, span, counter.clone(), transcoding_quality)
         .then(move |res| match res {
-            Ok(stream) => {
-                future::ok(
+            Ok(stream) => future::ok(
                 HyperResponse::builder()
                     .typed_header(ContentType::from(mime))
                     .header("X-Transcode", params.as_bytes())
                     .body(Body::wrap_stream(stream.map_err(Error::new_with_cause)))
-                    .unwrap()
-                )
-
-                
-            }
+                    .unwrap(),
+            ),
             Err(e) => {
                 error!("Cannot create transcoded stream, error: {}", e);
                 future::ok(short_response(
@@ -214,26 +208,25 @@ impl<T: AsyncRead + Unpin> Stream for ChunkStream<T> {
             error!("Polling after stream is done");
             return Poll::Ready(None);
         }
-        if self.remains == 0 {
-            self.get_mut().src.take();
+        let pin = self.get_mut();
+        if pin.remains == 0 {
+            pin.src.take();
             return Poll::Ready(None);
         }
-        let s = &mut self.get_mut();
         match ready! {
             {
-
-            let pinned_stream = Pin::new(s.src.as_mut().unwrap());
-            pinned_stream.poll_read(ctx, &mut s.buf[..])
+            let pinned_stream = Pin::new(pin.src.as_mut().unwrap());
+            pinned_stream.poll_read(ctx, &mut pin.buf[..])
             }
         } {
             Ok(read) => {
                 if read == 0 {
-                    s.src.take();
+                    pin.src.take();
                     Poll::Ready(None)
                 } else {
-                    let to_send = s.remains.min(read as u64);
-                    s.remains -= to_send;
-                    let chunk = s.buf[..to_send as usize].to_vec();
+                    let to_send = pin.remains.min(read as u64);
+                    pin.remains -= to_send;
+                    let chunk = pin.buf[..to_send as usize].to_vec();
                     Poll::Ready(Some(Ok(chunk)))
                 }
             }
@@ -257,7 +250,7 @@ impl<T: AsyncRead> ChunkStream<T> {
 
 async fn serve_opened_file(
     mut file: tokio::fs::File,
-    range: Option<ByteRenge>,
+    range: Option<ByteRange>,
     caching: Option<u32>,
     mime: mime::Mime,
 ) -> Result<Response, io::Error> {
@@ -267,8 +260,7 @@ async fn serve_opened_file(
         warn!("File has zero size ")
     }
     let last_modified = meta.modified().ok();
-    let mut resp = HyperResponse::builder()
-        .typed_header(ContentType::from(mime));
+    let mut resp = HyperResponse::builder().typed_header(ContentType::from(mime));
     if let Some(age) = caching {
         let cache = CacheControl::new()
             .with_public()
@@ -282,8 +274,9 @@ async fn serve_opened_file(
     let (start, end) = match range {
         Some(range) => match to_satisfiable_range(range, file_len) {
             Some(l) => {
-                resp = resp.status(StatusCode::PARTIAL_CONTENT)
-                .typed_header(ContentRange::bytes(into_range_bounds(l), Some(file_len)).unwrap());
+                resp = resp.status(StatusCode::PARTIAL_CONTENT).typed_header(
+                    ContentRange::bytes(into_range_bounds(l), Some(file_len)).unwrap(),
+                );
                 l
             }
             None => {
@@ -292,37 +285,43 @@ async fn serve_opened_file(
             }
         },
         None => {
-            resp = resp.status(StatusCode::OK)
-            .typed_header(AcceptRanges::bytes());
+            resp = resp
+                .status(StatusCode::OK)
+                .typed_header(AcceptRanges::bytes());
             (0, checked_dec(file_len))
         }
     };
     let _pos = file.seek(SeekFrom::Start(start)).await;
-    let stream = ChunkStream::new_with_limit(file, end - start + 1);
-    let resp = resp.typed_header(ContentLength(end - start + 1))
-        .body(Body::wrap_stream(stream)).unwrap();
+    let sz = end - start + 1;
+    let stream = ChunkStream::new_with_limit(file, sz);
+    let resp = resp
+        .typed_header(ContentLength(sz))
+        .body(Body::wrap_stream(stream))
+        .unwrap();
     Ok(resp)
 }
 
 fn serve_file_from_fs(
     full_path: &Path,
-    range: Option<ByteRenge>,
+    range: Option<ByteRange>,
     caching: Option<u32>,
 ) -> ResponseFuture {
-    let filename: PathBuf = full_path.into(); // we need to copy for lifetime issues as File::open and closures require 'static lifetime
-    let filename2: PathBuf = full_path.into();
-    let filename3: PathBuf = full_path.into();
-    Box::pin(
-        tokio::fs::File::open(filename)
-            .and_then(move |file| {
-                let mime = guess_mime_type(filename2);
+    let filename: PathBuf = full_path.into();
+    let fut = async move {
+        match tokio::fs::File::open(&filename).await {
+            Ok(file) => {
+                let mime = guess_mime_type(&filename);
                 serve_opened_file(file, range, caching, mime)
-            })
-            .or_else(move |_| {
-                error!("Error when sending file {:?}", filename3);
-                future::ok(short_response(StatusCode::NOT_FOUND, NOT_FOUND_MESSAGE))
-            }),
-    )
+                    .await
+                    .map_err(Error::new_with_cause)
+            }
+            Err(e) => {
+                error!("Error when sending file {:?} : {}", filename, e);
+                Ok(short_response(StatusCode::NOT_FOUND, NOT_FOUND_MESSAGE))
+            }
+        }
+    };
+    Box::pin(fut)
 }
 
 pub fn send_file_simple<P: AsRef<Path>>(
@@ -337,7 +336,7 @@ pub fn send_file_simple<P: AsRef<Path>>(
 pub fn send_file<P: AsRef<Path>>(
     base_path: &'static Path,
     file_path: P,
-    range: Option<ByteRenge>,
+    range: Option<ByteRange>,
     seek: Option<f32>,
     transcoding: super::TranscodingDetails,
     transcoding_quality: Option<QualityLevel>,
@@ -410,7 +409,7 @@ pub fn download_folder(base_path: &'static Path, folder_path: PathBuf) -> Respon
                     .map(std::borrow::ToOwned::to_owned)
                     .unwrap_or_else(|| "audio".into());
                 download_name.push_str(".tar");
-                let f = blocking(move || list_dir_files_only(&base_path, &folder_path))
+                let fut = blocking(move || list_dir_files_only(&base_path, &folder_path))
                     .map_ok(move |res| match res {
                         Ok(folder) => {
                             let total_len: u64;
@@ -421,22 +420,15 @@ pub fn download_folder(base_path: &'static Path, folder_path: PathBuf) -> Respon
                             debug!("Total len of folder is {}", total_len);
                             let files = folder.into_iter().map(|i| i.0);
                             let tar_stream = async_tar::TarStream::tar_iter(files);
-                            // let disposition = ContentDisposition {
-                            //     disposition: DispositionType::Attachment,
-                            //     parameters: vec![DispositionParam::Filename(
-                            //         Charset::Ext("UTF-8".into()),
-                            //         None,
-                            //         download_name.into(),
-                            //     )],
-                            // };
                             let disposition = format!("attachment; filename=\"{}\"", download_name);
                             HyperResponse::builder()
                                 .typed_header(ContentType::from(
-                                "application/x-tar".parse::<mime::Mime>().unwrap(),
+                                    "application/x-tar".parse::<mime::Mime>().unwrap(),
                                 ))
                                 .typed_header(ContentLength(total_len))
                                 .header(CONTENT_DISPOSITION, disposition.as_bytes())
-                                .body(Body::wrap_stream(tar_stream)).unwrap()
+                                .body(Body::wrap_stream(tar_stream))
+                                .unwrap()
                         }
                         Err(e) => {
                             error!("Cannot list download dir: {}", e);
@@ -448,7 +440,7 @@ pub fn download_folder(base_path: &'static Path, folder_path: PathBuf) -> Respon
                         Error::new_with_cause(e)
                     });
 
-                Box::pin(f)
+                Box::pin(fut)
             }
         });
     Box::pin(f)
@@ -458,9 +450,10 @@ fn json_response<T: serde::Serialize>(data: &T) -> Response {
     let json = serde_json::to_string(data).expect("Serialization error");
 
     HyperResponse::builder()
-    .typed_header(ContentType::json())
-    .typed_header(ContentLength(json.len() as u64))
-    .body(json.into()).unwrap()
+        .typed_header(ContentType::json())
+        .typed_header(ContentLength(json.len() as u64))
+        .body(json.into())
+        .unwrap()
 }
 
 const UKNOWN_NAME: &str = "unknown";

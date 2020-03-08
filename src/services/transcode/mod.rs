@@ -593,18 +593,6 @@ mod tests {
                 tokio::io::copy(&mut out, &mut file)
                     .await
                     .expect("file cope failed");
-                // loop {
-                //     match out.read(&mut buf) {
-                //         Ok(n) => {
-                //             if n == 0 {
-                //                 break;
-                //             } else {
-                //                 file.write_all(&mut buf).expect("Write to file error")
-                //             }
-                //         }
-                //         Err(e) => panic!("stdout read error {:?}", e),
-                //     }
-                // }
             }
             child.await
         };
@@ -665,7 +653,7 @@ mod tests {
             "audioserve_transcoded5.opus",
             Some(0.1),
             None as Option<&str>,
-            false,
+            true,
             Some(TimeSpan {
                 start: 100,
                 duration: Some(1800),

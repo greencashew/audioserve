@@ -169,7 +169,8 @@ fn main() {
         } else {
             let c = get_cache();
             info!(
-                "Using transcoding cache, remaining capacity (files,size) : {:?}",
+                "Using transcoding cache at {:?}, remaining capacity (files,size) : {:?}",
+                get_config().transcoding.cache.root_dir,
                 c.free_capacity()
             )
         }
