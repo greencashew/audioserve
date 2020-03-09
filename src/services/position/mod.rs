@@ -4,6 +4,7 @@ use futures::future;
 use hyper::{Body, Request};
 use std::str::FromStr;
 use websock::{self as ws, spawn_websocket};
+use tokio::task::block_in_place;
 
 mod cache;
 
@@ -82,7 +83,7 @@ pub fn position_service(req: Request<Body>) -> ResponseFuture {
             .and_then(str::parse);
 
         match message {
-            Ok(message) => match message {
+            Ok(message) => Box::pin(future::ok(block_in_place( || { match message {
                 Msg::Position {
                     position,
                     file_path,
@@ -107,16 +108,16 @@ pub fn position_service(req: Request<Body>) -> ResponseFuture {
                         }
                     };
 
-                    Box::pin(future::ok(None))
+                    None
                 }
                 Msg::GenericQuery { group } => {
                     let last = CACHE.get_last(group);
                     let res = Reply { folder: None, last };
 
-                    Box::pin(future::ok(Some(ws::Message::text(
+                    Some(ws::Message::text(
                         serde_json::to_string(&res).unwrap(),
                         m.context(),
-                    ))))
+                    ))
                 }
 
                 Msg::FolderQuery { folder_path } => {
@@ -128,12 +129,12 @@ pub fn position_service(req: Request<Body>) -> ResponseFuture {
                         folder,
                     };
 
-                    Box::pin(future::ok(Some(ws::Message::text(
+                    Some(ws::Message::text(
                         serde_json::to_string(&res).unwrap(),
                         m.context(),
-                    ))))
+                    ))
                 }
-            },
+            }}))),
             Err(e) => {
                 error!("Position message error: {}", e);
                 Box::pin(future::ok(None))
