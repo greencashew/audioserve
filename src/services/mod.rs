@@ -1,4 +1,4 @@
-use self::auth::Authenticator;
+use self::auth::{Authenticator, AuthResult};
 use self::search::Search;
 use self::subs::{
     collections_list, download_folder, get_folder, recent, search, send_file, send_file_simple,
@@ -114,10 +114,10 @@ impl<C: 'static> Service<Request<Body>> for FileSendService<C> {
         let resp = match self.authenticator {
             Some(ref auth) => {
                 Box::pin(auth.authenticate(req).and_then(move |result| match result {
-                    Ok((req, _creds)) => {
-                        FileSendService::<C>::process_checked(req, searcher, transcoding)
+                    AuthResult::Authenticated{request, ..} => {
+                        FileSendService::<C>::process_checked(request, searcher, transcoding)
                     }
-                    Err(resp) => Box::pin(future::ok(resp)),
+                    AuthResult::LoggedIn(resp)|AuthResult::Rejected(resp) => Box::pin(future::ok(resp)),
                 }))
             }
             None => FileSendService::<C>::process_checked(req, searcher, transcoding),

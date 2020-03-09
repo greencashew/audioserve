@@ -18,7 +18,14 @@ use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::form_urlencoded;
 
-type AuthResult<T> = Result<(Request<Body>, T), Response<Body>>;
+pub enum AuthResult<T> {
+    Authenticated{
+        credentials: T,
+        request: Request<Body>
+    },
+    Rejected(Response<Body>),
+    LoggedIn(Response<Body>),
+}
 type AuthFuture<T> = Pin<Box<dyn Future<Output = Result<AuthResult<T>, Error>> + Send>>;
 
 pub trait Authenticator: Send + Sync {
@@ -50,16 +57,17 @@ impl Authenticator for SharedSecretAuthenticator {
     type Credentials = ();
     fn authenticate(&self, req: Request<Body>) -> AuthFuture<()> {
         fn deny() -> AuthResult<()> {
-            Err(short_response(StatusCode::UNAUTHORIZED, ACCESS_DENIED))
+            AuthResult::Rejected(short_response(StatusCode::UNAUTHORIZED, ACCESS_DENIED))
         }
         // this is part where client can authenticate itself and get token
         if req.method() == Method::POST && req.uri().path() == "/authenticate" {
             debug!("Authentication request");
-            let auth = self.clone();
+            let auth = self.clone(); // TODO: data is self need to be 'static - is there better way?
             return Box::pin(
-                hyper::body::to_bytes(req.into_body())
-                    .map_err(Error::new_with_cause)
-                    .map_ok(move |b| {
+                async move {
+                match hyper::body::to_bytes(req.into_body()).await {
+                    Err(e) => Err(Error::new_with_cause(e)),
+                    Ok(b) => {
                         let params = form_urlencoded::parse(b.as_ref())
                             .into_owned()
                             .collect::<HashMap<String, String>>();
@@ -82,15 +90,16 @@ impl Authenticator for SharedSecretAuthenticator {
                                     .as_str(),
                                 );
 
-                                Err(resp.body(token.into()).unwrap())
+                                Ok(AuthResult::LoggedIn(resp.body(token.into()).unwrap()))
                             } else {
-                                deny()
+                                Ok(deny())
                             }
                         } else {
-                            deny()
+                            Ok(deny())
                         }
-                    }),
-            );
+                    }
+                }
+            })
         } else {
             // And in this part we check token
             let mut token = req
@@ -109,7 +118,7 @@ impl Authenticator for SharedSecretAuthenticator {
             }
         }
         // If everything is ok we return credentials (in this case they are just unit type) and we return back request
-        Box::pin(future::ok(Ok((req, ()))))
+        Box::pin(future::ok(AuthResult::Authenticated{request:req, credentials:()}))
     }
 }
 
