@@ -1,7 +1,6 @@
 use std::borrow;
 use std::ffi::OsStr;
 use std::fs;
-use std::fs::DirEntry;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -9,7 +8,7 @@ use super::audio_meta::{get_audio_properties, Chapter, MediaInfo};
 use super::transcode::TimeSpan;
 use super::types::*;
 use crate::config::get_config;
-use crate::util::{guess_mime_type, os_to_string};
+use crate::util::{guess_mime_type, os_to_string, get_real_file_type};
 use regex::Regex;
 
 pub fn list_dir<P: AsRef<Path>, P2: AsRef<Path>>(
@@ -416,36 +415,6 @@ pub fn list_dir_files_only<P: AsRef<Path>, P2: AsRef<Path>>(
             Err(e)
         }
     }
-}
-
-#[cfg(feature = "symlinks")]
-pub fn get_real_file_type<P: AsRef<Path>>(
-    dir_entry: &DirEntry,
-    full_path: P,
-    allow_symlinks: bool,
-) -> Result<::std::fs::FileType, io::Error> {
-    let ft = dir_entry.file_type()?;
-
-    if allow_symlinks && ft.is_symlink() {
-        let p = fs::read_link(dir_entry.path())?;
-        let ap = if p.is_relative() {
-            full_path.as_ref().join(p)
-        } else {
-            p
-        };
-        Ok(ap.metadata()?.file_type())
-    } else {
-        Ok(ft)
-    }
-}
-
-#[cfg(not(feature = "symlinks"))]
-pub fn get_real_file_type<P: AsRef<Path>>(
-    dir_entry: &DirEntry,
-    _full_path: P,
-    _allow_symlinks: bool,
-) -> Result<::std::fs::FileType, io::Error> {
-    dir_entry.file_type()
 }
 
 #[cfg(test)]
