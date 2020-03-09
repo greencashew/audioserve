@@ -159,7 +159,7 @@ fn main() {
     env_logger::init();
     debug!("Started with following config {:?}", get_config());
 
-    media_info::init();
+    services::audio_meta::init_media_lib();
 
     #[cfg(feature = "transcoding-cache")]
     {
