@@ -566,7 +566,7 @@ mod tests {
     use std::fs::remove_file;
     use std::path::Path;
 
-    fn dummy_transcode<P: AsRef<Path>, R: AsRef<Path>>(
+    async fn dummy_transcode<P: AsRef<Path>, R: AsRef<Path>>(
         output_file: P,
         seek: Option<f32>,
         copy_file: Option<R>,
@@ -596,8 +596,8 @@ mod tests {
             }
             child.await
         };
-        let mut rt = tokio::runtime::Runtime::new().expect("cannot create runtime");
-        let status = rt.block_on(f).expect("cannot get status");
+        
+        let status = f.await.expect("cannot get status");
         assert!(status.success());
         assert!(out_file.exists());
 
@@ -616,26 +616,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_transcode() {
+    #[tokio::test]
+    async fn test_transcode() {
         dummy_transcode(
             "audioserve_transcoded.opus",
             None,
             None as Option<&str>,
             true,
             None,
-        )
+        ).await
     }
 
-    #[test]
-    fn test_transcode_seek() {
+    #[tokio::test]
+    async fn test_transcode_seek() {
         dummy_transcode(
             "audioserve_transcoded2.opus",
             Some(0.8),
             None as Option<&str>,
             false,
             None,
-        );
+        ).await;
         let out_file = temp_dir().join("audioserve_transcoded2.opus");
         dummy_transcode(
             "audioserve_transcoded3.opus",
@@ -643,12 +643,12 @@ mod tests {
             Some(&out_file),
             true,
             None,
-        );
+        ).await;
         remove_file(out_file).unwrap();
     }
 
-    #[test]
-    fn test_transcode_span() {
+    #[tokio::test]
+    async fn test_transcode_span() {
         dummy_transcode(
             "audioserve_transcoded5.opus",
             Some(0.1),
@@ -658,6 +658,6 @@ mod tests {
                 start: 100,
                 duration: Some(1800),
             }),
-        );
+        ).await;
     }
 }
