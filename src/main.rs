@@ -145,6 +145,28 @@ fn start_server(
     Ok(rt)
 }
 
+#[cfg(not(unix))]
+async fn terminate_server() {
+    use tokio::signal;
+    signal::ctrl_c().await.unwrap_or(());
+
+}
+
+#[cfg(unix)]
+async fn terminate_server() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt()).expect("Cannot create SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("Cannot create SIGTERM handler");
+    let mut sigquit = signal(SignalKind::quit()).expect("Cannot create SIGQUIT handler");
+
+    tokio::select!(
+        _ = sigint.next() => {info!("Terminated on SIGINT")},
+        _ = sigterm.next() => {info!("Terminated on SIGTERM")},
+        _ = sigquit.next() => {info!("Terminated on SIGQUIT")}
+    )
+
+}
+
 fn main() {
     #[cfg(unix)]
     {
@@ -191,41 +213,24 @@ fn main() {
         }
     };
 
-    #[cfg(unix)]
-    {
-        use nix::sys::signal;
-        let mut sigs = signal::SigSet::empty();
-        sigs.add(signal::Signal::SIGINT);
-        sigs.add(signal::Signal::SIGQUIT);
-        sigs.add(signal::Signal::SIGTERM);
-        sigs.thread_block().ok();
-        match sigs.wait() {
-            Ok(sig) => info!("Terminating by signal {}", sig),
-            Err(e) => error!("Signal wait error: {}", e),
-        }
-        #[cfg(feature = "shared-positions")]{
-            debug!("Saving shared positions");
-            runtime.block_on(crate::services::position::save_positions());
-        }
-        //TODO - rather try async signals and Server::with_shutdown
-        runtime.shutdown_timeout(std::time::Duration::from_millis(300));
+    runtime.block_on(terminate_server());
 
-        #[cfg(feature = "transcoding-cache")]
-        {
-            debug!("Saving transcoding cache");
-            use crate::services::transcode::cache::get_cache;
-            if let Err(e) = get_cache().save_index() {
-                error!("Error saving transcoding cache index {}", e);
-            }
+    #[cfg(feature = "shared-positions")]{
+        debug!("Saving shared positions");
+        runtime.block_on(crate::services::position::save_positions());
+    }
+        //graceful shutdown of server will wait till transcoding ends, so rather shut it down hard
+    runtime.shutdown_timeout(std::time::Duration::from_millis(300));
+
+    #[cfg(feature = "transcoding-cache")]
+    {
+        debug!("Saving transcoding cache");
+        use crate::services::transcode::cache::get_cache;
+        if let Err(e) = get_cache().save_index() {
+            error!("Error saving transcoding cache index {}", e);
         }
+    }
         
-    }
-
-    // TODO - for non linux platforms transcoding cache and  positions will not be saved
-    #[cfg(not(unix))]
-    {
-        let mut runtime = runtime;
-        runtime.block_on(future::pending::<()>());
-    }
+    
     info!("Server finished");
 }
