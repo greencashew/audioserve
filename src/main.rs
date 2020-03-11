@@ -183,7 +183,7 @@ fn main() {
         }
     };
 
-    let runtime = match start_server(server_secret) {
+    let mut runtime = match start_server(server_secret) {
         Ok(rt) => rt,
         Err(e) => {
             error!("Error starting server: {}", e);
@@ -203,20 +203,25 @@ fn main() {
             Ok(sig) => info!("Terminating by signal {}", sig),
             Err(e) => error!("Signal wait error: {}", e),
         }
+        #[cfg(feature = "shared-positions")]{
+            debug!("Saving shared positions");
+            runtime.block_on(crate::services::position::save_positions());
+        }
         //TODO - rather try async signals and Server::with_shutdown
         runtime.shutdown_timeout(std::time::Duration::from_millis(300));
 
         #[cfg(feature = "transcoding-cache")]
         {
+            debug!("Saving transcoding cache");
             use crate::services::transcode::cache::get_cache;
             if let Err(e) = get_cache().save_index() {
                 error!("Error saving transcoding cache index {}", e);
             }
         }
-        #[cfg(feature = "shared-positions")]
-        crate::services::position::save_positions();
+        
     }
 
+    // TODO - for non linux platforms transcoding cache and  positions will not be saved
     #[cfg(not(unix))]
     {
         let mut runtime = runtime;
