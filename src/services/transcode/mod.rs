@@ -15,13 +15,14 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::process::{ChildStdout, Command};
 use tokio::time::delay_for;
+use std::borrow::Cow;
 
 #[cfg(feature = "transcoding-cache")]
 pub mod cache;
 pub mod codecs;
 
 pub trait AudioCodec {
-    fn quality_args(&self) -> Vec<String>;
+    fn quality_args(&self) -> Vec<Cow<'static, str>>;
     fn codec_args(&self) -> &'static [&'static str];
     /// in kbps
     fn bitrate(&self) -> u32;
@@ -43,7 +44,7 @@ pub enum TranscodingFormat {
 pub struct TranscodingArgs {
     format: &'static str,
     codec_args: &'static [&'static str],
-    quality_args: Vec<String>,
+    quality_args: Vec<Cow<'static, str>>,
 }
 
 macro_rules! targs {
@@ -249,7 +250,7 @@ impl Transcoder {
         let targs = self.quality.args();
         self.input_file_args(&mut cmd, file);
         cmd.args(targs.codec_args)
-            .args(targs.quality_args)
+            .args(targs.quality_args.iter().map(|i| i.as_ref()))
             .arg("-f")
             .arg(targs.format)
             .arg("pipe:1")
