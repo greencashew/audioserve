@@ -16,6 +16,7 @@ use std::borrow;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 use url::form_urlencoded;
 
 pub enum AuthResult<T> {
@@ -33,19 +34,26 @@ pub trait Authenticator: Send + Sync {
     fn authenticate(&self, req: Request<Body>) -> AuthFuture<Self::Credentials>;
 }
 
-#[derive(Clone)]
-pub struct SharedSecretAuthenticator {
+#[derive(Clone, Debug)]
+struct Secrets {
     shared_secret: String,
     server_secret: Vec<u8>,
     token_validity_hours: u32,
 }
 
+#[derive(Clone)]
+pub struct SharedSecretAuthenticator {
+    secrets: Arc<Secrets>,
+}
+
 impl SharedSecretAuthenticator {
     pub fn new(shared_secret: String, server_secret: Vec<u8>, token_validity_hours: u32) -> Self {
         SharedSecretAuthenticator {
+            secrets: Arc::new(Secrets{
             shared_secret,
             server_secret,
             token_validity_hours,
+            })
         }
     }
 }
@@ -62,7 +70,7 @@ impl Authenticator for SharedSecretAuthenticator {
         // this is part where client can authenticate itself and get token
         if req.method() == Method::POST && req.uri().path() == "/authenticate" {
             debug!("Authentication request");
-            let auth = self.clone(); // TODO: data is self need to be 'static - is there better way?
+            let auth = self.secrets.clone(); // TODO: auth need to be 'static - is there better way?
             return Box::pin(
                 async move {
                 match hyper::body::to_bytes(req.into_body()).await {
@@ -113,7 +121,7 @@ impl Authenticator for SharedSecretAuthenticator {
                     .and_then(|c| c.get(COOKIE_NAME).map(borrow::ToOwned::to_owned));
             }
 
-            if token.is_none() || !self.token_ok(&token.unwrap()) {
+            if token.is_none() || !self.secrets.token_ok(&token.unwrap()) {
                 return Box::pin(future::ok(deny()));
             }
         }
@@ -122,7 +130,7 @@ impl Authenticator for SharedSecretAuthenticator {
     }
 }
 
-impl SharedSecretAuthenticator {
+impl Secrets {
     fn auth_token_ok(&self, token: &str) -> bool {
         let parts = token
             .split('|')
