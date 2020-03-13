@@ -26,9 +26,6 @@ pub trait AudioCodec {
     fn codec_args(&self) -> &'static [&'static str];
     /// in kbps
     fn bitrate(&self) -> u32;
-    fn transcode_from(&self) -> u32 {
-        (f64::from(self.bitrate()) * 1.2) as u32
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -160,7 +157,7 @@ pub enum AudioFilePath<S> {
     Transcoded(S),
 }
 
-impl<S> std::convert::AsRef<S> for AudioFilePath<S> {
+impl<S> AsRef<S> for AudioFilePath<S> {
     fn as_ref(&self) -> &S {
         use self::AudioFilePath::*;
         match self {
@@ -372,7 +369,7 @@ impl Transcoder {
                             };
 
                             match res {
-                                Ok(()) => box_me(
+                                Ok(()) => Box::pin(
                                     cache_finish
                                         .commit()
                                         .map_err(|e| error!("Error in cache: {}", e))
@@ -445,10 +442,9 @@ impl Transcoder {
         let counter2 = counter.clone();
         match cmd.spawn() {
             Ok(mut child) => {
-                if child.stdout.is_some() {
+                if let Some(out)  = child.stdout.take() {
                     counter.fetch_add(1, Ordering::SeqCst);
                     let start = Instant::now();
-                    let out = child.stdout.take().unwrap();
                     let stream = ChunkStream::new(out);
                     let pid = child.id();
                     debug!("waiting for transcode process to end");

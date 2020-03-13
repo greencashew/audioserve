@@ -204,33 +204,34 @@ impl<T: AsyncRead + Unpin> Stream for ChunkStream<T> {
     type Item = Result<Vec<u8>, io::Error>;
 
     fn poll_next(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Option<Self::Item>> {
-        if self.src.is_none() {
+        let pin = self.get_mut();
+        if let Some(ref mut src) = pin.src {
+            if pin.remains == 0 {
+                pin.src.take();
+                return Poll::Ready(None);
+            }
+            match ready! {
+                {
+                let pinned_stream = Pin::new(src);
+                pinned_stream.poll_read(ctx, &mut pin.buf[..])
+                }
+            } {
+                Ok(read) => {
+                    if read == 0 {
+                        pin.src.take();
+                        Poll::Ready(None)
+                    } else {
+                        let to_send = pin.remains.min(read as u64);
+                        pin.remains -= to_send;
+                        let chunk = pin.buf[..to_send as usize].to_vec();
+                        Poll::Ready(Some(Ok(chunk)))
+                    }
+                }
+                Err(e) => Poll::Ready(Some(Err(e))),
+            }
+        } else {
             error!("Polling after stream is done");
             return Poll::Ready(None);
-        }
-        let pin = self.get_mut();
-        if pin.remains == 0 {
-            pin.src.take();
-            return Poll::Ready(None);
-        }
-        match ready! {
-            {
-            let pinned_stream = Pin::new(pin.src.as_mut().unwrap());
-            pinned_stream.poll_read(ctx, &mut pin.buf[..])
-            }
-        } {
-            Ok(read) => {
-                if read == 0 {
-                    pin.src.take();
-                    Poll::Ready(None)
-                } else {
-                    let to_send = pin.remains.min(read as u64);
-                    pin.remains -= to_send;
-                    let chunk = pin.buf[..to_send as usize].to_vec();
-                    Poll::Ready(Some(Ok(chunk)))
-                }
-            }
-            Err(e) => Poll::Ready(Some(Err(e))),
         }
     }
 }
