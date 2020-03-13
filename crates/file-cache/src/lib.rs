@@ -6,8 +6,6 @@ extern crate quick_error;
 #[macro_use]
 extern crate log;
 extern crate byteorder;
-#[cfg(feature = "asynch")]
-use self::asynch::{get_asynch_file, get_asynch_file2, save_index_asynch, Finisher, get_asynch_writable};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use data_encoding::BASE64URL_NOPAD;
 use linked_hash_map::LinkedHashMap;
@@ -22,6 +20,9 @@ use std::sync::{Arc, RwLock};
 pub use self::error::Error;
 
 #[cfg(feature = "asynch")]
+pub use asynch::{Cache as AsyncCache, Finisher};
+
+#[cfg(feature = "asynch")]
 mod asynch;
 mod error;
 
@@ -31,8 +32,8 @@ const INDEX: &str = "index";
 const MAX_KEY_SIZE: usize = 4096;
 const FILE_KEY_LEN: usize = 32;
 
-pub type Result<T> = std::result::Result<T, Error>;
-pub(crate) type CacheInnerType = Arc<RwLock<CacheInner>>;
+type Result<T> = std::result::Result<T, Error>;
+type CacheInnerType = Arc<RwLock<CacheInner>>;
 
 #[derive(Clone)]
 pub struct Cache {
@@ -57,27 +58,7 @@ impl Cache {
         })
     }
 
-    #[cfg(feature = "asynch")]
-    pub async fn add_async<S: AsRef<str>>(&self, key: S) -> Result<(tokio::fs::File, Finisher)> {
-        let key: String = key.as_ref().into();
-        get_asynch_writable(key, self.inner.clone()).await
-    }
-
-    #[cfg(feature = "asynch")]
-    pub async fn get_async<S>(&self, key: S) -> Result<Option<tokio::fs::File>>
-    where
-        S: AsRef<str>,
-    {
-        get_asynch_file(key.as_ref().to_string(), self.inner.clone()).await
-    }
-
-    #[cfg(feature = "asynch")]
-    pub async fn get_async2<S>(&self, key: S) -> Result<Option<(tokio::fs::File, std::path::PathBuf)>>
-    where
-        S: AsRef<str>,
-    {
-        get_asynch_file2(key.as_ref().to_string(), self.inner.clone()).await
-    }
+    
 
     pub fn get<S: AsRef<str>>(&self, key: S) -> Option<Result<fs::File>> {
         let mut cache = self.inner.write().expect("Cannot lock cache");
@@ -87,11 +68,6 @@ impl Cache {
     pub fn save_index(&self) -> Result<()> {
         let cache = self.inner.write().expect("Cannot lock cache");
         cache.save_index()
-    }
-
-    #[cfg(feature = "asynch")]
-    pub async fn save_index_async(&self) -> Result<()> {
-        save_index_asynch(self.inner.clone()).await
     }
 
     pub fn len(&self) -> u64 {
@@ -120,7 +96,7 @@ impl Cache {
 impl Drop for Cache {
     fn drop(&mut self) {
         // if dropping last reference to cache save index
-        // TODO: reconsider - also FileGuards can hold refeence
+        // TODO: reconsider - also FileGuards can hold reference
         if Arc::strong_count(&self.inner) == 1 {
             if let Err(e) = self.save_index() {
                 error!("Error saving cache index: {}", e)

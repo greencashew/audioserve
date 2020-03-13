@@ -226,7 +226,7 @@ fn main() {
     {
         debug!("Saving transcoding cache");
         use crate::services::transcode::cache::get_cache;
-        if let Err(e) = get_cache().save_index() {
+        if let Err(e) = get_cache().save_index_blocking() {
             error!("Error saving transcoding cache index {}", e);
         }
     }

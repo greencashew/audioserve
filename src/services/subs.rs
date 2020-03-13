@@ -89,7 +89,7 @@ fn serve_file_cached_or_transcoded(
     let cache = get_cache();
     let cache_key = cache_key(&full_path, transcoding_quality, span);
     let fut = cache
-        .get_async2(cache_key)
+        .get2(cache_key)
         .then(|res| match res {
             Err(e) => {
                 error!("Cache lookup error: {}", e);

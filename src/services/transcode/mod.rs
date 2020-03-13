@@ -345,7 +345,7 @@ impl Transcoder {
         let cache = get_cache();
         //TODO: this is ugly -  unify either we will use Path or OsStr!
         let key = cache_key(file.as_ref().as_ref(), quality, span);
-        let fut = cache.add_async(key).then(move |res| match res {
+        let fut = cache.add(key).then(move |res| match res {
             Err(e) => {
                 warn!("Cannot create cache entry: {}", e);
                 future::ready(
@@ -376,7 +376,7 @@ impl Transcoder {
                                         .and_then(|_| {
                                             debug!("Added to cache");
                                             if false {
-                                                box_me(get_cache().save_index_async().map_err(
+                                                box_me(get_cache().save_index().map_err(
                                                     |e| {
                                                         error!(
                                                             "Error when saving cache index: {}",
