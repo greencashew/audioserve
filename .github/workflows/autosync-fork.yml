@@ -2,7 +2,7 @@ name: Fork auto synchronisation
 
 on:
   schedule:
-    - cron: '0 * 0 ? * * *'
+    - cron: '* * * * *'
 
 jobs:
   sync:
