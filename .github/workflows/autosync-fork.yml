@@ -1,0 +1,17 @@
+name: Fork auto synchronisation
+
+on:
+  schedule:
+    - cron: '* * * * *'
+
+jobs:
+  sync:
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: TG908/fork-sync@v1.1
+        with:
+          github_token: ${{ secrets.FORK_SYNC_TOKEN }}
+          base: master
+          head: master
