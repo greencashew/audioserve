@@ -25,3 +25,4 @@ on:
                 docker buildx build --push \
                 --tag greencashew/audioserve:${{ env.RELEASE_VERSION }}
                 --platform linux/amd64,linux/arm/v7,linux/arm64 . 
+                
