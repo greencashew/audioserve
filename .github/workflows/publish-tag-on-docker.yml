@@ -4,22 +4,23 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  release:
+    types: [published, created, edited]
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v1
+      - name: Checkout code
+        uses: actions/checkout@v2
       - name: Get release version
         run: echo ::set-env name=RELEASE_VERSION::${GITHUB_REF#refs/*/}
       - name: Test if tag retrived 
-        run: |
-          echo $RELEASE_VERSION
-          echo ${{ env.RELEASE_VERSION }}
+        run: echo ${{ env.RELEASE_VERSION }}
       - name: Install buildx
-          id: buildx
-          uses: crazy-max/ghaction-docker-buildx@v1
-          with:
-            version: latest
+        id: buildx
+        uses: crazy-max/ghaction-docker-buildx@v1
+        with:
+          version: latest
       - name: Login to docker hub
           run: echo "${{ secrets.DOCKER_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
       - name: Build and Publish on docker hub
