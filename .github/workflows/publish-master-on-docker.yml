@@ -1,4 +1,4 @@
-name: Publish on docker
+name: Publish master on docker
 
 on:
   push:
