@@ -1,0 +1,24 @@
+name: Publish master on docker
+
+on:
+  push:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Install buildx
+        id: buildx
+        uses: crazy-max/ghaction-docker-buildx@v1
+        with:
+          version: latest
+      - name: Login to docker hub
+        run: echo "${{ secrets.DOCKER_ACCESS_TOKEN }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+      - name: Build and Publish on docker hub
+        run: |
+          docker buildx build --push \
+            --tag greencashew/audioserve:latest \
+            --platform linux/amd64,linux/arm/v7,linux/arm64 . 
