@@ -1,29 +1,32 @@
-use super::subs::short_response;
 use crate::error::{bail, Result};
+use crate::services::RequestWrapper;
 use crate::util::ResponseBuilderExt;
 use data_encoding::BASE64;
 use futures::{future, prelude::*};
 use headers::authorization::Bearer;
 use headers::{Authorization, ContentLength, ContentType, Cookie, HeaderMapExt};
 use hyper::header::SET_COOKIE;
-use hyper::{Body, Method, Request, Response, StatusCode};
+use hyper::{Body, Method, Response};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::{
     digest::{digest, SHA256},
     hmac,
 };
-use std::borrow;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{borrow, time::Duration};
 use thiserror::Error;
+use tokio::time::sleep;
 use url::form_urlencoded;
+
+use super::resp;
 
 pub enum AuthResult<T> {
     Authenticated {
         credentials: T,
-        request: Request<Body>,
+        request: RequestWrapper,
     },
     Rejected(Response<Body>),
     LoggedIn(Response<Body>),
@@ -32,7 +35,7 @@ type AuthFuture<T> = Pin<Box<dyn Future<Output = Result<AuthResult<T>>> + Send>>
 
 pub trait Authenticator: Send + Sync {
     type Credentials;
-    fn authenticate(&self, req: Request<Body>) -> AuthFuture<Self::Credentials>;
+    fn authenticate(&self, req: RequestWrapper) -> AuthFuture<Self::Credentials>;
 }
 
 #[derive(Clone, Debug)]
@@ -60,20 +63,19 @@ impl SharedSecretAuthenticator {
 }
 
 const COOKIE_NAME: &str = "audioserve_token";
-const ACCESS_DENIED: &str = "Access denied";
 
 impl Authenticator for SharedSecretAuthenticator {
     type Credentials = ();
-    fn authenticate(&self, req: Request<Body>) -> AuthFuture<()> {
+    fn authenticate(&self, mut req: RequestWrapper) -> AuthFuture<()> {
         fn deny() -> AuthResult<()> {
-            AuthResult::Rejected(short_response(StatusCode::UNAUTHORIZED, ACCESS_DENIED))
+            AuthResult::Rejected(resp::deny())
         }
         // this is part where client can authenticate itself and get token
-        if req.method() == Method::POST && req.uri().path() == "/authenticate" {
+        if req.method() == Method::POST && req.path() == "/authenticate" {
             debug!("Authentication request");
-            let auth = self.secrets.clone(); // TODO: auth need to be 'static - is there better way?
+            let auth = self.secrets.clone();
             return Box::pin(async move {
-                match hyper::body::to_bytes(req.into_body()).await {
+                match req.body_bytes().await {
                     Err(e) => bail!(e),
                     Ok(b) => {
                         let params = form_urlencoded::parse(b.as_ref())
@@ -90,7 +92,7 @@ impl Authenticator for SharedSecretAuthenticator {
                                     .header(
                                         SET_COOKIE,
                                         format!(
-                                            "{}={}; Max-Age={}",
+                                            "{}={}; Max-Age={}; SameSite=Lax",
                                             COOKIE_NAME,
                                             token,
                                             10 * 365 * 24 * 3600
@@ -100,9 +102,20 @@ impl Authenticator for SharedSecretAuthenticator {
 
                                 Ok(AuthResult::LoggedIn(resp.body(token.into()).unwrap()))
                             } else {
+                                error!(
+                                    "Invalid authentication: invalid shared secret, client: {:?}",
+                                    req.remote_addr()
+                                );
+                                // Let's not return failure immediately, because somebody is using wrong shared secret
+                                // Legitimate user can wait a bit, but for brute force attack it can be advantage not to reply quickly
+                                sleep(Duration::from_millis(500)).await;
                                 Ok(deny())
                             }
                         } else {
+                            error!(
+                                "Invalid authentication: missing shared secret, client: {:?}",
+                                req.remote_addr()
+                            );
                             Ok(deny())
                         }
                     }
@@ -121,7 +134,20 @@ impl Authenticator for SharedSecretAuthenticator {
                     .and_then(|c| c.get(COOKIE_NAME).map(borrow::ToOwned::to_owned));
             }
 
-            if token.is_none() || !self.secrets.token_ok(&token.unwrap()) {
+            if token.is_none() {
+                error!(
+                    "Invalid access: missing token on path {}, client: {:?}",
+                    req.path(),
+                    req.remote_addr()
+                );
+                return Box::pin(future::ok(deny()));
+            }
+            if !self.secrets.token_ok(&token.unwrap()) {
+                error!(
+                    "Invalid access: invalid token on path {}, client: {:?}",
+                    req.path(),
+                    req.remote_addr()
+                );
                 return Box::pin(future::ok(deny()));
             }
         }
@@ -137,10 +163,22 @@ impl Secrets {
     fn auth_token_ok(&self, token: &str) -> bool {
         let parts = token
             .split('|')
-            .map(|s| BASE64.decode(s.as_bytes()))
-            .filter_map(Result::ok)
+            .filter_map(|s| match BASE64.decode(s.as_bytes()) {
+                Ok(x) => Some(x),
+                Err(e) => {
+                    error!(
+                        "Invalid base64 in authentication token {} in string {}",
+                        e, s
+                    );
+                    None
+                }
+            })
             .collect::<Vec<_>>();
         if parts.len() == 2 {
+            if parts[0].len() != 32 {
+                error!("Random salt must be 32 bytes");
+                return false;
+            }
             let mut hash2 = self.shared_secret.clone().into_bytes();
             let hash = &parts[1];
             hash2.extend(&parts[0]);
@@ -270,6 +308,9 @@ impl ::std::str::FromStr for Token {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::init::init_default_config;
+    use borrow::Cow;
+    use hyper::{Request, StatusCode};
 
     #[test]
     fn test_token() {
@@ -283,5 +324,103 @@ mod tests {
         assert!(new_token.is_valid(b"my big secret"));
         assert!(!new_token.is_valid(b"wrong secret"));
         assert!(new_token.validity() - now() <= 24 * 3600);
+    }
+
+    fn build_request(body: impl Into<Body>) -> RequestWrapper {
+        let b = body.into();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/authenticate")
+            .body(b)
+            .unwrap();
+
+        RequestWrapper::new(req, None, None, false).unwrap()
+    }
+
+    fn build_authenticated_request(token: &str) -> RequestWrapper {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/neco")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::from("Hey"))
+            .unwrap();
+
+        RequestWrapper::new(req, None, None, false).unwrap()
+    }
+
+    fn shared_secret(sec: &str) -> String {
+        let mut salt = [0u8; 32];
+        let rng = SystemRandom::new();
+        rng.fill(&mut salt).expect("cannot generate random number");
+        let mut res = BASE64.encode(&salt);
+        res.push('|');
+        let mut hash: Vec<u8> = sec.into();
+        hash.extend(&salt);
+        let hash = digest(&SHA256, &hash);
+        res.push_str(&BASE64.encode(hash.as_ref()));
+        res
+    }
+
+    fn shared_secret_form(sec: &str) -> String {
+        let ss = shared_secret(sec);
+        let encoded_ss: Cow<str> =
+            percent_encoding::percent_encode(ss.as_bytes(), percent_encoding::NON_ALPHANUMERIC)
+                .into();
+        "secret=".to_string() + encoded_ss.as_ref()
+    }
+
+    #[tokio::test]
+    async fn test_authenticator_login() {
+        env_logger::try_init().ok();
+        let invalid_secret = "secret=aaaaa";
+        let shared = "kulisak";
+        init_default_config();
+
+        let ss = shared_secret_form(shared);
+        let aut = SharedSecretAuthenticator::new(shared.into(), (&b"123456"[..]).into(), 24);
+        let req = build_request(ss);
+        let res = aut
+            .authenticate(req)
+            .await
+            .expect("authentication procedure internal error");
+
+        if let AuthResult::LoggedIn(res) = res {
+            assert_eq!(res.status(), StatusCode::OK);
+            let token = res
+                .into_body()
+                .filter_map(|x| future::ready(x.ok()))
+                .map(|x| x.to_vec())
+                .concat()
+                .await;
+            let token = String::from_utf8(token).expect("token is string");
+            assert!(token.len() > 64);
+            let req = build_authenticated_request(&token);
+
+            let res = aut
+                .authenticate(req)
+                .await
+                .expect("authentication procedure internal error");
+
+            if let AuthResult::Authenticated { request, .. } = res {
+                info!("token {:?} is OK", request.headers().get("Authorization"))
+            } else {
+                panic!("Token authentication failed")
+            }
+        } else {
+            panic!("Authentication should succeed")
+        }
+
+        let wrap = build_request(invalid_secret);
+
+        let res = aut
+            .authenticate(wrap)
+            .await
+            .expect("authentication procedure internal error");
+
+        if let AuthResult::Rejected(res) = res {
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED)
+        } else {
+            panic!("Authentication should fail");
+        }
     }
 }

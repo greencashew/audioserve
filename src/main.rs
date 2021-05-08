@@ -10,9 +10,9 @@ use error::{bail, Context, Error};
 use futures::prelude::*;
 use hyper::{service::make_service_fn, Server as HttpServer};
 use ring::rand::{SecureRandom, SystemRandom};
-use services::auth::SharedSecretAuthenticator;
-use services::search::Search;
-use services::{FileSendService, TranscodingDetails};
+use services::{
+    auth::SharedSecretAuthenticator, search::Search, ServiceFactory, TranscodingDetails,
+};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -66,46 +66,58 @@ fn generate_server_secret<P: AsRef<Path>>(file: P) -> Result<Vec<u8>, Error> {
     }
 }
 
-fn start_server(server_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Error> {
-    let cfg = get_config();
-    let svc = FileSendService {
-        authenticator: get_config().shared_secret.as_ref().map(
-            |secret| -> Arc<Box<dyn services::auth::Authenticator<Credentials = ()>>> {
-                Arc::new(Box::new(SharedSecretAuthenticator::new(
-                    secret.clone(),
-                    server_secret,
-                    cfg.token_validity_hours,
-                )))
-            },
-        ),
-        search: Search::new(),
-        transcoding: TranscodingDetails {
-            transcodings: Arc::new(AtomicUsize::new(0)),
-            max_transcodings: cfg.transcoding.max_parallel_processes,
-        },
+macro_rules! get_url_path {
+    () => {
+        get_config()
+            .url_path_prefix
+            .as_ref()
+            .map(|s| s.to_string() + "/")
+            .unwrap_or_default()
     };
+}
+
+fn start_server(server_secret: Vec<u8>) -> tokio::runtime::Runtime {
+    let cfg = get_config();
+
     let addr = cfg.listen;
     let start_server = async move {
+        let authenticator = get_config().shared_secret.as_ref().map(|secret| {
+            SharedSecretAuthenticator::new(secret.clone(), server_secret, cfg.token_validity_hours)
+        });
+        let transcoding = TranscodingDetails {
+            transcodings: Arc::new(AtomicUsize::new(0)),
+            max_transcodings: cfg.transcoding.max_parallel_processes,
+        };
+        let svc_factory =
+            ServiceFactory::new(authenticator, Search::new(), transcoding, cfg.limit_rate);
+
         let server: Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> =
             match get_config().ssl.as_ref() {
                 None => {
-                    let server = HttpServer::bind(&addr).serve(make_service_fn(move |_| {
-                        future::ok::<_, error::Error>(svc.clone())
-                    }));
-                    info!("Server listening on {}", &addr);
+                    let server = HttpServer::bind(&addr).serve(make_service_fn(
+                        move |conn: &hyper::server::conn::AddrStream| {
+                            let remote_addr = conn.remote_addr();
+                            svc_factory.create(Some(remote_addr), false)
+                        },
+                    ));
+                    info!("Server listening on {}{}", &addr, get_url_path!());
                     Box::pin(server.map_err(|e| e.into()))
                 }
                 Some(ssl) => {
                     #[cfg(feature = "tls")]
                     {
-                        info!("Server Listening on {} with TLS", &addr);
+                        use tokio::net::TcpStream;
+                        use tokio_native_tls::TlsStream;
+                        info!("Server listening on {}{} with TLS", &addr, get_url_path!());
                         let create_server = async move {
                             let incoming = tls::tls_acceptor(&addr, &ssl)
                                 .await
                                 .context("TLS handshake")?;
                             let server = HttpServer::builder(incoming)
-                                .serve(make_service_fn(move |_| {
-                                    future::ok::<_, error::Error>(svc.clone())
+                                .serve(make_service_fn(move |conn: &TlsStream<TcpStream>| {
+                                    let remote_addr =
+                                        conn.get_ref().get_ref().get_ref().peer_addr().ok();
+                                    svc_factory.create(remote_addr, true)
                                 }))
                                 .await;
 
@@ -128,16 +140,15 @@ fn start_server(server_secret: Vec<u8>) -> Result<tokio::runtime::Runtime, Error
         server.await
     };
 
-    let rt = tokio::runtime::Builder::new()
-        .threaded_scheduler()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .core_threads(cfg.thread_pool.num_threads as usize)
-        .max_threads(cfg.thread_pool.num_threads as usize + cfg.thread_pool.queue_size as usize)
+        .worker_threads(cfg.thread_pool.num_threads as usize)
+        .max_blocking_threads(cfg.thread_pool.queue_size as usize)
         .build()
         .unwrap();
 
     rt.spawn(start_server.map_err(|e| error!("Http Server Error: {}", e)));
-    Ok(rt)
+    rt
 }
 
 #[cfg(not(unix))]
@@ -154,9 +165,9 @@ async fn terminate_server() {
     let mut sigquit = signal(SignalKind::quit()).expect("Cannot create SIGQUIT handler");
 
     tokio::select!(
-        _ = sigint.next() => {info!("Terminated on SIGINT")},
-        _ = sigterm.next() => {info!("Terminated on SIGTERM")},
-        _ = sigquit.next() => {info!("Terminated on SIGQUIT")}
+        _ = sigint.recv() => {info!("Terminated on SIGINT")},
+        _ = sigterm.recv() => {info!("Terminated on SIGTERM")},
+        _ = sigquit.recv() => {info!("Terminated on SIGQUIT")}
     )
 }
 
@@ -180,7 +191,7 @@ fn main() {
     {
         use crate::services::transcode::cache::get_cache;
         if get_config().transcoding.cache.disabled {
-            info!("Trascoding cache is disabled")
+            info!("Transcoding cache is disabled")
         } else {
             let c = get_cache();
             info!(
@@ -198,13 +209,7 @@ fn main() {
         }
     };
 
-    let mut runtime = match start_server(server_secret) {
-        Ok(rt) => rt,
-        Err(e) => {
-            error!("Error starting server: {}", e);
-            process::exit(3)
-        }
-    };
+    let runtime = start_server(server_secret);
 
     runtime.block_on(terminate_server());
 
@@ -218,10 +223,12 @@ fn main() {
 
     #[cfg(feature = "transcoding-cache")]
     {
-        debug!("Saving transcoding cache");
-        use crate::services::transcode::cache::get_cache;
-        if let Err(e) = get_cache().save_index_blocking() {
-            error!("Error saving transcoding cache index {}", e);
+        if !get_config().transcoding.cache.disabled {
+            debug!("Saving transcoding cache");
+            use crate::services::transcode::cache::get_cache;
+            if let Err(e) = get_cache().save_index_blocking() {
+                error!("Error saving transcoding cache index {}", e);
+            }
         }
     }
 

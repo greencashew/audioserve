@@ -1,12 +1,11 @@
 #[macro_use]
 extern crate log;
 extern crate websock as ws;
-use futures::future;
 use hyper::server::Server;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{self, Body, Method, Request, Response, StatusCode};
-use std::convert::Infallible;
 use std::io;
+use std::{convert::Infallible, time::Duration};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
@@ -35,7 +34,7 @@ fn not_found() -> Response<Body> {
         .unwrap()
 }
 
-async fn route(req: Request<Body>) -> Result<Response<Body>, io::Error> {
+async fn route(req: Request<Body>) -> Result<Response<Body>, Infallible> {
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/") => send_file(INDEX_PATH).await,
         (&Method::GET, "/socket") => server_upgrade(req).await,
@@ -48,19 +47,25 @@ async fn route(req: Request<Body>) -> Result<Response<Body>, io::Error> {
 async fn server_upgrade(req: Request<Body>) -> Result<Response<Body>, io::Error> {
     debug!("We got these headers: {:?}", req.headers());
 
-    Ok(ws::spawn_websocket(req, |m| {
-        debug!("Got message {:?}", m);
-        let counter: u64 = {
-            let mut c = m.context_ref().write().unwrap();
-            *c = *c + 1;
-            *c
-        };
+    Ok(ws::spawn_websocket_with_timeout(
+        req,
+        |m| {
+            Box::pin(async move {
+                debug!("Got message {:?}", m);
+                let counter: u64 = {
+                    let mut c = m.context_ref().write().await;
+                    *c = *c + 1;
+                    *c
+                };
 
-        Box::pin(future::ok(Some(ws::Message::text(
-            format!("{}: {}", counter, m.to_str().unwrap()),
-            m.context(),
-        ))))
-    }))
+                Ok(Some(ws::Message::text(
+                    format!("{}: {}", counter, m.to_str().unwrap()),
+                    m.context(),
+                )))
+            })
+        },
+        Duration::from_secs(5 * 60),
+    ))
 }
 #[tokio::main]
 async fn main() -> Result<(), GenericError> {

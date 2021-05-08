@@ -13,11 +13,19 @@ import config from "./config";
 
 $(function () {
     const RECENT_QUERY = "__RECENT__";
-    let baseUrl;
+    var baseUrl;
     if (AUDIOSERVE_DEVELOPMENT) {
         baseUrl = `${window.location.protocol}//${window.location.hostname}:${config.DEVELOPMENT_PORT}`;
     } else {
+        console.log(`Running audioserve web client version ${AUDIOSERVE_VERSION}`);
         baseUrl = `${window.location.protocol}//${window.location.host}${window.location.pathname.length > 1 ? window.location.pathname : ""}`;
+        if (baseUrl.endsWith('/')) {
+            baseUrl = baseUrl.substr(0, baseUrl.length-1);
+        }
+    }
+
+    const isApple = () => {
+        return navigator.userAgent.indexOf("iPhone") > 0 || navigator.userAgent.indexOf("iPad") > 0
     }
 
 
@@ -26,7 +34,7 @@ $(function () {
     let pendingCall = null;
     let pendingSpinner = null;
     let transcodingLimit = 58;
-    let transcoding = "m";
+    let transcoding = isApple() ? "0":"m"; //Do not select default transcoding for Apple devices
     let ordering = "a";
     let transcodingLimits = { l: 38, m: 56, h: 76 };
     let restoredPosition = false;
@@ -97,7 +105,6 @@ $(function () {
 
                 // opens websocket if group is defined
                 if (sync.groupPrefix && ! sync.active) {
-                    sync.open();
                     $('#position-sync-btn').show();
                 } else if (!sync.groupPrefix && sync.active) {
                     sync.close();
@@ -279,7 +286,7 @@ $(function () {
                 if (lastFile) {
                     let target = $(`#files a[href="${lastFile}"]`);
                     if (target.length) {
-                        restoredPosition = true;
+                        restoredPosition = !startPlay;
                         let time = window.localStorage.getItem("audioserve_time");
                         showInView(target);
                         playFile(target, !startPlay, time);
@@ -371,11 +378,9 @@ $(function () {
             let item = $('<li class="breadcrumb-item">');
             if (i == segments.length - 1) {
                 item.addClass("active");
-                item.text(segments[i]);
-            } else {
-                let partPath = segments.slice(0, i + 1).join('/');
-                item.append($(`<a href="${partPath}">${segments[i]}</a></li>`));
-            }
+            } 
+            let partPath = segments.slice(0, i + 1).join('/');
+            item.append($(`<a href="#${partPath}">${segments[i]}</a></li>`));
             bc.append(item);
         }
 
@@ -417,7 +422,12 @@ $(function () {
                         config.MIN_TIME_DIFFERENCE_FOR_POSITION_SHARING) return;
 
                     const normName = (n) => {
-                        n = n.replace(/\$\$.*\$\$/, '');
+                        n = n.replace(/\$\$[\d\-]+\$\$/, '');
+                        let idx = n.indexOf("$$");
+                        if (idx>=0) {
+                            n = n.slice(idx+2);
+                        }
+                        
                         const extIndex = n.lastIndexOf('.');
                         if (extIndex > 0) {
                             n = n.substr(0, extIndex);
@@ -438,7 +448,13 @@ $(function () {
 
                         if (item.folder == window.localStorage.getItem("audioserve_folder")) {
                             let target = $(`#files a[href="${itemPath}"]`);
+                            if (target.length) {
+                            restoredPosition = false;
+                            showInView(target);
                             playFile(target, false, item.position);
+                            } else {
+                                console.error(`File ${itemPath} is missing from current folder`)
+                            }
                         } else {
                             window.localStorage.setItem("audioserve_folder", item.folder);
                             window.localStorage.setItem("audioserve_file", itemPath);
@@ -533,8 +549,12 @@ $(function () {
     });
 
     $("#breadcrumb").on("click", "li.breadcrumb-item a", evt => {
-        loadFolder($(evt.target).attr("href"));
         evt.preventDefault();
+        let path = $(evt.target).attr("href");
+        if (path.startsWith("#")) {
+            path = path.slice(1);
+        }
+        loadFolder(path);
     });
 
     $("#files").on("click", "a.list-group-item-action", evt => {
@@ -598,6 +618,8 @@ $(function () {
         evt.preventDefault();
         let secret = $("#secret-input").val();
         let group = $("#group-input").val();
+        const failedAlert = $("#login-failed-alert");
+        failedAlert.hide();
         window.localStorage.setItem("audioserve_group", group);
         login(secret)
             .then(data => {
@@ -606,7 +628,13 @@ $(function () {
                     $("#login-dialog").modal("hide");
                 });
             })
-            .catch(err => console.error("Login failed", err));
+            .catch(err => {
+                console.error("Login failed", err);
+                failedAlert.show();
+            })
+            .finally(() => {
+                $("#secret-input").val("");
+            });
 
     });
 
@@ -729,10 +757,20 @@ $(function () {
         checkRecent();
     });
 
+    $("#login-dialog").on('hidden.bs.modal', (evt) => {
+        // reset login dialog after hidden
+        $("#secret-input").val("");
+        $("#login-failed-alert").hide();
+    });
+
     const reloadCurrentFolder = (fromHistory, resetPlayer) => {
         if (resetPlayer) clearPlayer();
-        loadFolder(window.localStorage.getItem("audioserve_folder") ||
-            "", fromHistory);
+        let folder = window.localStorage.getItem("audioserve_folder") ||"";
+        if (!fromHistory && location.hash && location.hash.length>1) {
+            folder = decodeURIComponent(location.hash.slice(1));
+            location.hash = "";
+        }
+        loadFolder(folder, fromHistory);
     };
 
     loadCollections().then(() => {

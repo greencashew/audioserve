@@ -28,6 +28,10 @@
     cursor: pointer;
     position: relative;
   }
+
+  .audio-player .controls .slider .progress {
+    border: 2px  #D8D8D8 solid;
+  }
   .audio-player .slider .progress {
     background-color: #0275d8;
     border-radius: inherit;
@@ -47,14 +51,14 @@
   }
   
   .audio-player .controls .slider .progress .pin {
-    height: 24px;
+    height: 32px;
   }
 
   .audio-player .slider .player-cache {
     width: 100%;
     height: 3px;
     position: relative;
-    top: 8px;
+    top: 16px;
     cursor: default;
 }
 
@@ -79,8 +83,8 @@
   .audio-player .controls .slider {
     margin-left: 16px;
     margin-right: 16px;
-    border-radius: 4px;
-    height: 8px;
+    border-radius: 8px;
+    height: 16px;
   }
   .audio-player .controls .slider .progress {
     width: 0;
@@ -88,7 +92,7 @@
   }
   .audio-player .controls .slider .progress .pin {
     right: -8px;
-    top: -9px;
+    top: -11px;
   }
   .audio-player .controls span {
     cursor: default;
@@ -99,18 +103,23 @@
   .audio-player .volume .volume-btn {
     cursor: pointer;
   }
+
+  .audio-player .digits {
+    color: white;
+    font-weight: bold;
+  }
   .audio-player .volume .volume-btn.open path {
     fill: #0275d8;
   }
   .audio-player .volume .volume-controls {
     z-index: 99;
-    width: 30px;
-    height: 135px;
+    width: 32px;
+    height: 165px;
     background-color: rgba(0, 0, 0, 0.8);
     border-radius: 7px;
     position: absolute;
     left: -3px;
-    bottom: 52px;
+    bottom: 32px;
     flex-direction: column;
     align-items: center;
     display: flex;
@@ -132,6 +141,12 @@
   .audio-player .volume .volume-controls .slider .progress .pin {
     left: -5px;
     top: -8px;
+  }
+
+  .audio-player .extra-buttons {
+    display: flex;
+    width: 64px;
+    justify-content: space-between;
   }
   
   .audio-player svg, .audio-player img {
@@ -156,3 +171,24 @@
       transform: rotateZ(1turn);
     }
   }
+
+  @media (max-width: 480px) {
+  .audio-player .extra-buttons {
+    display: flex;
+    width: 74px;
+    justify-content: space-between;
+    position: absolute;
+    bottom: 58px;
+    right: 15px;
+    background-color: #dddddde8;
+    padding: 5px;
+    border-radius: 7px;
+    z-index: 999;
+  }
+
+  @media (max-height: 480px) {
+    .audio-player .extra-buttons {
+      display: none !important
+    }
+  }
+}

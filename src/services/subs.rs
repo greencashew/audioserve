@@ -1,52 +1,41 @@
-use super::audio_folder::list_dir;
 #[cfg(feature = "folder-download")]
 use super::audio_folder::list_dir_files_only;
-use super::audio_folder::parse_chapter_path;
-use super::search::{Search, SearchTrait};
-use super::transcode::{guess_format, AudioFilePath, QualityLevel, TimeSpan};
-use super::types::*;
-use super::Counter;
-use crate::config::get_config;
-use crate::error::{Error, Result};
-use crate::util::{
-    checked_dec, guess_mime_type, into_range_bounds, to_satisfiable_range, ResponseBuilderExt,
+use super::{
+    audio_folder::{list_dir, parse_chapter_path},
+    resp,
+    search::{Search, SearchTrait},
+    transcode::{guess_format, AudioFilePath, QualityLevel, TimeSpan},
+    types::*,
+    Counter,
+};
+use crate::{
+    config::get_config,
+    error::{Error, Result},
+    util::{
+        checked_dec, guess_mime_type, into_range_bounds, to_satisfiable_range, ResponseBuilderExt,
+    },
 };
 use futures::prelude::*;
 use futures::{future, ready, Stream};
 use headers::{AcceptRanges, CacheControl, ContentLength, ContentRange, ContentType, LastModified};
-#[cfg(feature = "folder-download")]
-use hyper::header::CONTENT_DISPOSITION;
 use hyper::{Body, Response as HyperResponse, StatusCode};
-use std::collections::Bound;
-use std::ffi::OsStr;
-use std::io::{self, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::sync::atomic::Ordering;
-use std::task::{Context, Poll};
-use tokio::io::AsyncRead;
-use tokio::task::spawn_blocking as blocking;
+use std::{
+    collections::Bound,
+    ffi::OsStr,
+    io::{self, SeekFrom},
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::atomic::Ordering,
+    task::{Context, Poll},
+};
+use tokio::{
+    io::{AsyncRead, AsyncSeekExt, ReadBuf},
+    task::spawn_blocking as blocking,
+};
 
 pub type ByteRange = (Bound<u64>, Bound<u64>);
-
-pub const NOT_FOUND_MESSAGE: &str = "Not Found";
-const SEVER_ERROR_TRANSCODING: &str = "Server error during transcoding process";
-
 type Response = HyperResponse<Body>;
-
 pub type ResponseFuture = Pin<Box<dyn Future<Output = Result<Response, Error>> + Send>>;
-
-pub fn short_response(status: StatusCode, msg: &'static str) -> Response {
-    HyperResponse::builder()
-        .status(status)
-        .typed_header(ContentLength(msg.len() as u64))
-        .body(msg.into())
-        .unwrap()
-}
-
-pub fn short_response_boxed(status: StatusCode, msg: &'static str) -> ResponseFuture {
-    Box::pin(future::ok(short_response(status, msg)))
-}
 
 #[cfg(not(feature = "transcoding-cache"))]
 fn serve_file_cached_or_transcoded(
@@ -142,20 +131,37 @@ fn serve_file_transcoded_checked(
     transcoding_quality: QualityLevel,
 ) -> ResponseFuture {
     let counter = transcoding.transcodings;
+    let mut running_transcodings = counter.load(Ordering::SeqCst);
+    loop {
+        if running_transcodings >= transcoding.max_transcodings {
+            warn!(
+                "Max transcodings reached {}/{}",
+                running_transcodings, transcoding.max_transcodings
+            );
+            return resp::fut(resp::too_many_requests);
+        }
 
-    let running_transcodings: u32 = counter.load(Ordering::SeqCst) as u32;
-    if running_transcodings >= transcoding.max_transcodings {
-        warn!("Max transcodings reached {}", transcoding.max_transcodings);
-        short_response_boxed(StatusCode::SERVICE_UNAVAILABLE, "Max transcodings reached")
-    } else {
-        debug!(
-            "Sendig file {:?} transcoded - remaining slots {}/{}",
-            &full_path,
-            transcoding.max_transcodings - running_transcodings - 1,
-            transcoding.max_transcodings
-        );
-        serve_file_transcoded(full_path, seek, span, transcoding_quality, &counter)
+        match counter.compare_exchange(
+            running_transcodings,
+            running_transcodings + 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {
+                running_transcodings = running_transcodings + 1;
+                break;
+            }
+            Err(curr) => running_transcodings = curr,
+        }
     }
+
+    debug!(
+        "Sendig file {:?} transcoded - remaining slots {}/{}",
+        &full_path,
+        transcoding.max_transcodings - running_transcodings,
+        transcoding.max_transcodings
+    );
+    serve_file_transcoded(full_path, seek, span, transcoding_quality, counter)
 }
 
 fn serve_file_transcoded(
@@ -163,7 +169,7 @@ fn serve_file_transcoded(
     seek: Option<f32>,
     span: Option<TimeSpan>,
     transcoding_quality: QualityLevel,
-    counter: &Counter,
+    counter: Counter,
 ) -> ResponseFuture {
     let transcoder = get_config().transcoder(transcoding_quality);
     let params = transcoder.transcoding_params();
@@ -185,10 +191,7 @@ fn serve_file_transcoded(
             ),
             Err(e) => {
                 error!("Cannot create transcoded stream, error: {}", e);
-                future::ok(short_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    SEVER_ERROR_TRANSCODING,
-                ))
+                future::ok(resp::internal_error())
             }
         });
     Box::pin(fut)
@@ -210,13 +213,15 @@ impl<T: AsyncRead + Unpin> Stream for ChunkStream<T> {
                 pin.src.take();
                 return Poll::Ready(None);
             }
+            let mut buf = ReadBuf::new(&mut pin.buf[..]);
             match ready! {
                 {
                 let pinned_stream = Pin::new(src);
-                pinned_stream.poll_read(ctx, &mut pin.buf[..])
+                pinned_stream.poll_read(ctx, &mut buf)
                 }
             } {
-                Ok(read) => {
+                Ok(_) => {
+                    let read = buf.filled().len();
                     if read == 0 {
                         pin.src.take();
                         Poll::Ready(None)
@@ -318,7 +323,7 @@ fn serve_file_from_fs(
             }
             Err(e) => {
                 error!("Error when sending file {:?} : {}", filename, e);
-                Ok(short_response(StatusCode::NOT_FOUND, NOT_FOUND_MESSAGE))
+                Ok(resp::not_found())
             }
         }
     };
@@ -381,69 +386,129 @@ pub fn get_folder(
         blocking(move || list_dir(&base_path, &folder_path, ordering))
             .map_ok(|res| match res {
                 Ok(folder) => json_response(&folder),
-                Err(_) => short_response(StatusCode::NOT_FOUND, NOT_FOUND_MESSAGE),
+                Err(_) => resp::not_found(),
             })
             .map_err(Error::new),
     )
 }
 
-#[cfg(not(feature = "folder-download"))]
-pub fn download_folder(_base_path: &'static Path, _folder_path: PathBuf) -> ResponseFuture {
-    unimplemented!();
-}
-
 #[cfg(feature = "folder-download")]
-pub fn download_folder(base_path: &'static Path, folder_path: PathBuf) -> ResponseFuture {
+pub fn download_folder(
+    base_path: &'static Path,
+    folder_path: PathBuf,
+    format: DownloadFormat,
+) -> ResponseFuture {
+    use anyhow::Context;
+    use hyper::header::CONTENT_DISPOSITION;
     let full_path = base_path.join(&folder_path);
-    let f = tokio::fs::metadata(full_path.clone())
-        .map_err(|e| {
-            error!("Cannot get meta for download path");
-            Error::new(e).context("metadata for folder download")
-        })
-        .and_then(move |meta| {
-            if meta.is_file() {
-                serve_file_from_fs(&full_path, None, None)
-            } else {
-                let mut download_name = folder_path
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .map(std::borrow::ToOwned::to_owned)
-                    .unwrap_or_else(|| "audio".into());
-                download_name.push_str(".tar");
-                let fut = blocking(move || list_dir_files_only(&base_path, &folder_path))
-                    .map_ok(move |res| match res {
-                        Ok(folder) => {
-                            let total_len: u64;
-                            {
-                                let lens_iter = (&folder).iter().map(|i| i.1);
-                                total_len = async_tar::calc_size(lens_iter);
-                            }
-                            debug!("Total len of folder is {}", total_len);
-                            let files = folder.into_iter().map(|i| i.0);
-                            let tar_stream = async_tar::TarStream::tar_iter(files);
-                            let disposition = format!("attachment; filename=\"{}\"", download_name);
-                            HyperResponse::builder()
-                                .typed_header(ContentType::from(
-                                    "application/x-tar".parse::<mime::Mime>().unwrap(),
-                                ))
-                                .typed_header(ContentLength(total_len))
-                                .header(CONTENT_DISPOSITION, disposition.as_bytes())
-                                .body(Body::wrap_stream(tar_stream))
-                                .unwrap()
-                        }
-                        Err(e) => {
-                            error!("Cannot list download dir: {}", e);
-                            short_response(StatusCode::NOT_FOUND, NOT_FOUND_MESSAGE)
-                        }
-                    })
-                    .map_err(|e| {
-                        error!("Error listing files for tar: {}", e);
-                        Error::new(e).context("listing files for tar")
-                    });
+    let f = async move {
+        let meta = tokio::fs::metadata(&full_path)
+            .await
+            .context("metadata for folder download")?;
+        if meta.is_file() {
+            serve_file_from_fs(&full_path, None, None).await
+        } else {
+            let mut download_name = folder_path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .map(std::borrow::ToOwned::to_owned)
+                .unwrap_or_else(|| "audio".into());
 
-                Box::pin(fut)
+            download_name.push_str(format.extension());
+
+            match blocking(move || list_dir_files_only(&base_path, &folder_path)).await {
+                Ok(Ok(folder)) => {
+                    let total_len: u64 = match format {
+                        DownloadFormat::Tar => {
+                            let lens_iter = folder.iter().map(|i| i.1);
+                            async_tar::calc_size(lens_iter)
+                        }
+                        DownloadFormat::Zip => {
+                            let iter = folder.iter().map(|&(ref path, len)| (path, len));
+                            async_zip::calc_size(iter).context("calc zip size")?
+                        }
+                    };
+
+                    debug!("Total len of folder is {}", total_len);
+                    let files = folder.into_iter().map(|i| i.0);
+
+                    let stream: Box<dyn Stream<Item = _> + Unpin + Send> = match format {
+                        DownloadFormat::Tar => Box::new(async_tar::TarStream::tar_iter(files)),
+                        DownloadFormat::Zip => {
+                            let zipper = async_zip::Zipper::from_iter(files);
+                            Box::new(zipper.zipped_stream())
+                        }
+                    };
+
+                    let disposition = format!("attachment; filename=\"{}\"", download_name);
+                    Ok(HyperResponse::builder()
+                        .typed_header(ContentType::from(format.mime()))
+                        .typed_header(ContentLength(total_len))
+                        .header(CONTENT_DISPOSITION, disposition.as_bytes())
+                        .body(Body::wrap_stream(stream))
+                        .unwrap())
+                }
+                Ok(Err(e)) => Err(Error::new(e).context("listing directory")),
+                Err(e) => Err(Error::new(e).context("spawn blocking directory")),
             }
-        });
+        }
+    };
+    // let f = tokio::fs::metadata(full_path.clone())
+    //     .map_err(|e| {
+    //         error!("Cannot get meta for download path");
+    //         Error::new(e).context("metadata for folder download")
+    //     })
+    //     .and_then(move |meta| {
+    //         if meta.is_file() {
+    //             serve_file_from_fs(&full_path, None, None)
+    //         } else {
+    //             let mut download_name = folder_path
+    //                 .file_name()
+    //                 .and_then(OsStr::to_str)
+    //                 .map(std::borrow::ToOwned::to_owned)
+    //                 .unwrap_or_else(|| "audio".into());
+    //             download_name.push_str(format.extension());
+    //             let fut = blocking(move || list_dir_files_only(&base_path, &folder_path))
+    //                 .and_then(move |res| match res {
+    //                     Ok(folder) => {
+    //                         let total_len: u64 = match format {
+    //                             DownloadFormat::Tar => {
+    //                                 let lens_iter = folder.iter().map(|i| i.1);
+    //                                 async_tar::calc_size(lens_iter)
+    //                             }
+    //                             DownloadFormat::Zip => {
+    //                                 let iter = folder.iter().map(|&(ref path, len)| (path, len));
+    //                                 async_zip::calc_size(iter).unwrap()
+    //                             }
+    //                         };
+
+    //                         debug!("Total len of folder is {}", total_len);
+    //                         let files = folder.into_iter().map(|i| i.0);
+    //                         let tar_stream = async_tar::TarStream::tar_iter(files);
+    //                         let disposition = format!("attachment; filename=\"{}\"", download_name);
+    //                         future::ok(HyperResponse::builder()
+    //                             .typed_header(ContentType::from(
+    //                                 format.mime(),
+    //                             ))
+    //                             .typed_header(ContentLength(total_len))
+    //                             .header(CONTENT_DISPOSITION, disposition.as_bytes())
+    //                             .body(Body::wrap_stream(tar_stream))
+    //                             .unwrap()
+    //                         )
+    //                     }
+    //                     Err(e) => {
+    //                         error!("Cannot list download dir: {}", e);
+    //                         future::ok(resp::not_found())
+    //                     }
+    //                 })
+    //                 .map_err(|e| {
+    //                     error!("Error listing files for archive {}", e);
+    //                     Error::new(e).context("listing files for archive")
+    //                 });
+
+    //             Box::pin(fut)
+    //         }
+    //     });
     Box::pin(f)
 }
 

@@ -1,5 +1,5 @@
+pub use self::error::{Error, Result};
 use super::services::transcode::{QualityLevel, Transcoder, TranscodingFormat};
-
 use crate::util;
 use std::env;
 use std::fs::File;
@@ -7,8 +7,6 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-pub use self::error::{Error, Result};
 
 mod cli;
 mod validators;
@@ -90,7 +88,7 @@ impl TranscodingCacheConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TranscodingConfig {
-    pub max_parallel_processes: u32,
+    pub max_parallel_processes: usize,
     pub max_runtime_hours: u32,
     #[cfg(feature = "transcoding-cache")]
     pub cache: TranscodingCacheConfig,
@@ -102,7 +100,7 @@ pub struct TranscodingConfig {
 impl Default for TranscodingConfig {
     fn default() -> Self {
         TranscodingConfig {
-            max_parallel_processes: (2 * num_cpus::get()) as u32,
+            max_parallel_processes: (2 * num_cpus::get()),
             max_runtime_hours: 24,
             #[cfg(feature = "transcoding-cache")]
             cache: TranscodingCacheConfig::default(),
@@ -248,7 +246,9 @@ pub struct Config {
     pub listen: SocketAddr,
     pub thread_pool: ThreadPoolConfig,
     pub base_dirs: Vec<PathBuf>,
+    pub url_path_prefix: Option<String>,
     pub shared_secret: Option<String>,
+    pub limit_rate: Option<f32>,
     pub transcoding: TranscodingConfig,
     pub token_validity_hours: u32,
     pub secret_file: PathBuf,
@@ -259,7 +259,11 @@ pub struct Config {
     pub search_cache: bool,
     pub disable_folder_download: bool,
     pub chapters: ChaptersSize,
+    pub no_dir_collaps: bool,
+    pub ignore_chapters_meta: bool,
     pub positions_file: PathBuf,
+    pub positions_ws_timeout: Duration,
+    pub behind_proxy: bool,
 }
 
 impl Config {
@@ -321,6 +325,10 @@ impl Config {
             );
         }
 
+        if self.positions_ws_timeout < Duration::from_secs(60) {
+            return value_error!("positions-ws-timeout", "Timeout must be at least 60s");
+        }
+
         if !self.client_dir.is_dir() {
             return value_error!(
                 "client_dir",
@@ -366,6 +374,12 @@ impl Config {
             }
         }
 
+        if let Some(url) = &self.url_path_prefix {
+            if let Err(e) = validators::is_valid_url_path_prefix(url.clone()) {
+                return value_error!("url_path_prefix", e);
+            }
+        }
+
         Ok(())
     }
 }
@@ -375,9 +389,11 @@ impl Default for Config {
         let data_base_dir = base_data_dir();
         Config {
             base_dirs: vec![],
+            url_path_prefix: None,
             listen: ([0, 0, 0, 0], 3000u16).into(),
             thread_pool: ThreadPoolConfig::default(),
             shared_secret: None,
+            limit_rate: None,
             transcoding: TranscodingConfig::default(),
             token_validity_hours: 365 * 24,
             client_dir: "client/dist".into(),
@@ -388,7 +404,11 @@ impl Default for Config {
             search_cache: false,
             disable_folder_download: false,
             chapters: ChaptersSize::default(),
+            no_dir_collaps: false,
+            ignore_chapters_meta: false,
             positions_file: data_base_dir.join("audioserve.positions"),
+            positions_ws_timeout: Duration::from_secs(600),
+            behind_proxy: false,
         }
     }
 }
@@ -417,33 +437,27 @@ pub mod init {
     /// as tests are run concurrently it requires also some synchronication
     use super::{Config, BASE_DATA_DIR, CONFIG};
     use std::path::PathBuf;
-    use std::sync::Mutex;
-    lazy_static! {
-        static ref GUARD: Mutex<bool> = Mutex::new(false);
-    }
+    use std::sync::Once;
+    static INIT: Once = Once::new();
     /// this default config is used only for testing
     pub fn init_default_config() {
-        let mut l = GUARD.lock().unwrap();
-        unsafe {
-            if BASE_DATA_DIR.is_some() {
-                return;
-            }
+        INIT.call_once(|| {
             let base_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-            BASE_DATA_DIR = Some(base_dir);
-        }
-
-        let config = Config::default();
-        unsafe {
-            CONFIG = Some(config);
-        }
-        *l = true
+            unsafe {
+                BASE_DATA_DIR = Some(base_dir);
+            }
+            let config = Config::default();
+            unsafe {
+                CONFIG = Some(config);
+            }
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::init::init_default_config;
     use super::*;
-    use crate::config::init::init_default_config;
     #[test]
     fn test_default_serialize() {
         init_default_config();

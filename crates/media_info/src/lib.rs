@@ -57,7 +57,7 @@ impl Dictionary {
             if res.is_null() {
                 return None;
             }
-            return Some(string_from_ptr_lossy((*res).value));
+            Some(string_from_ptr_lossy((*res).value))
         }
     }
 
@@ -158,7 +158,8 @@ impl MediaFile {
                 for s in streams {
                     let codec_type = (*(**s).codecpar).codec_type;
                     if codec_type == ffi::AVMediaType_AVMEDIA_TYPE_AUDIO {
-                        m = (**s).metadata
+                        m = (**s).metadata;
+                        break;
                     }
                 }
             }
@@ -175,7 +176,7 @@ impl MediaFile {
     pub fn duration(&self) -> u64 {
         let d = unsafe { (*self.ctx).duration } / 1_000;
         if d < 0 {
-            return 0;
+            0
         } else {
             d as u64
         }
@@ -186,7 +187,7 @@ impl MediaFile {
         let b = unsafe { (*self.ctx).bit_rate } / 1000;
 
         if b < 0 {
-            return 0;
+            0
         } else {
             b as u32
         }
@@ -200,6 +201,10 @@ impl MediaFile {
 
     pub fn all_meta(&self) -> HashMap<String, String> {
         self.meta.get_all()
+    }
+
+    pub fn chapters_count(&self) -> usize {
+        unsafe { (*self.ctx).nb_chapters as usize }
     }
 
     pub fn chapters(&self) -> Option<Vec<Chapter>> {

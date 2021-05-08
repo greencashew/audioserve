@@ -19,19 +19,19 @@ fn create_parser<'a>() -> Parser<'a> {
         .arg(Arg::with_name("print-config")
             .long("print-config")
             .help("Will print current config, with all other options to stdout, usefull for creating config file")
-        )
+            )
         .arg(Arg::with_name("data-dir")
             .long("data-dir")
             .takes_value(true)
             .validator_os(parent_dir_exists)
             .env("AUDIOSERVE_DATA_DIR")
             .help("Base directory for data created by audioserve (caches, state, ...) [default is $HOME/.audioserve]")
-        )
+            )
         .arg(Arg::with_name("debug")
             .short("d")
             .long("debug")
             .help("Enable debug logging (detailed logging config can be done via RUST_LOG env. variable)")
-        )
+            )
         .arg(Arg::with_name("listen")
             .short("l")
             .long("listen")
@@ -39,18 +39,18 @@ fn create_parser<'a>() -> Parser<'a> {
             .takes_value(true)
             .validator(is_socket_addr)
             .env("AUDIOSERVE_LISTEN")
-        )
+            )
         .arg(Arg::with_name("thread-pool-large")
             .long("thread-pool-large")
             .help("Use larger thread pool (usually will not be needed)")       
-        )
+            )
         .arg(Arg::with_name("thread-pool-keep-alive-secs")
             .long("thread-pool-keep-alive-secs")
             .takes_value(true)
             .help("Threads in pool will shutdown after given seconds, if there is no work. Default is to keep threads forever.")
             .env("AUDIOSERVE_THREAD_POOL_KEEP_ALIVE")
             .validator(is_number)
-        )
+            )
         .arg(Arg::with_name("base-dir")
             .value_name("BASE_DIR")
             .multiple(true)
@@ -60,13 +60,13 @@ fn create_parser<'a>() -> Parser<'a> {
             .env("AUDIOSERVE_BASE_DIRS")
             .value_delimiter(":")
             .validator_os(is_existing_dir)
-            .help("Root directories for audio books, also refered as collections")
+            .help("Root directories for audio books, also referred as collections")
 
-        )
+            )
         .arg(Arg::with_name("no-authentication")
             .long("no-authentication")
             .help("no authentication required - mainly for testing purposes")
-        )
+            )
         .arg(Arg::with_name("shared-secret")
             .short("s")
             .long("shared-secret")
@@ -75,7 +75,14 @@ fn create_parser<'a>() -> Parser<'a> {
             // .required_unless_one(&["no-authentication", "shared-secret-file"])
             .env("AUDIOSERVE_SHARED_SECRET")
             .help("Shared secret for client authentication")
-        )
+            )
+        .arg(Arg::with_name("limit-rate")
+            .long("limit-rate")
+            .env("AUDIOSERVE_LIMIT_RATE")
+            .takes_value(true)
+            .validator(is_positive_float)
+            .help("Limits number of http request to x req/sec. Assures that resources are not exhausted in case of DDoS (but will also limit you). It's bit experimental now.")
+            )
         .arg(Arg::with_name("shared-secret-file")
             .long("shared-secret-file")
             .takes_value(true)
@@ -83,7 +90,7 @@ fn create_parser<'a>() -> Parser<'a> {
             // .required_unless_one(&["no-authentication", "shared-secret"])
             .env("AUDIOSERVE_SHARED_SECRET_FILE")
             .help("File containing shared secret, it's slightly safer to read it from file, then provide as command argument")
-        )
+            )
         .arg(Arg::with_name("transcoding-max-parallel-processes")
             .short("x")
             .long("transcoding-max-parallel-processes")
@@ -91,7 +98,7 @@ fn create_parser<'a>() -> Parser<'a> {
             .validator(is_number)
             .env("AUDIOSERVE_MAX_PARALLEL_PROCESSES")
             .help("Maximum number of concurrent transcoding processes [default: 2 * number of cores]")
-        )
+            )
         .arg(Arg::with_name("transcoding-max-runtime")
             .long("transcoding-max-runtime")
             .takes_value(true)
@@ -99,14 +106,14 @@ fn create_parser<'a>() -> Parser<'a> {
             .env("AUDIOSERVE_TRANSCODING_MAX_RUNTIME")
             .help("Max duration of transcoding process in hours. If takes longer process is killed. Default is 24h")
 
-        )
+            )
         .arg(Arg::with_name("token-validity-days")
             .long("token-validity-days")
             .takes_value(true)
             .validator(is_number)
             .env("AUDIOSERVE_TOKEN_VALIDITY_DAYS")
             .help("Validity of authentication token issued by this server in days[default 365, min 10]")
-        )
+            )
         .arg(Arg::with_name("client-dir")
             .short("c")
             .long("client-dir")
@@ -115,32 +122,55 @@ fn create_parser<'a>() -> Parser<'a> {
             .validator_os(is_existing_dir)
             .help("Directory with client files - index.html and bundle.js")
 
-        )
+            )
         .arg(Arg::with_name("secret-file")
             .long("secret-file")
             .takes_value(true)
             .validator_os(parent_dir_exists)
             .env("AUDIOSERVE_SECRET_FILE")
             .help("Path to file where server secret is kept - it's generated if it does not exists [default: is $HOME/.audioserve.secret]")
-        )
+            )
         .arg(Arg::with_name("cors")
             .long("cors")
             .help("Enable CORS - enabled any origin of requests")
-        )
+            )
         .arg(Arg::with_name("chapters-from-duration")
             .long("chapters-from-duration")
             .takes_value(true)
             .validator(is_number)
             .env("AUDIOSERVE_CHAPTERS_FROM_DURATION")
             .help("forces split of audio file larger then x mins into chapters (not physically, but it'll be just visible as folder with chapters)[default:0 e.g. disabled]")
-        )
+            )
         .arg(Arg::with_name("chapters-duration")
             .long("chapters-duration")
             .takes_value(true)
             .validator(is_number)
             .env("AUDIOSERVE_CHAPTERS_FROM_DURATION")
             .help("If long files is presented as chapters, one chapter has x mins [default: 30]")
-        );
+            )
+        .arg(Arg::with_name("no-dir-collaps")
+            .long("no-dir-collaps")
+            .help("Prevents automatic collaps/skip of directory with single chapterized audio file")
+
+            )
+        .arg(Arg::with_name("ignore-chapters-meta")
+            .long("ignore-chapters-meta")
+            .help("Ignore chapters metadata, so files with chapters will not be presented as folders")
+            )
+        .arg(Arg::with_name("url-path-prefix")
+        .long("url-path-prefix")
+        .takes_value(true)
+        .validator(is_valid_url_path_prefix)
+        .env("AUDIOSERVE_URL_PATH_PREFIX")
+        .help("Base URL is a fixed path that is before audioserve path part, must start with / and not end with /  [default: none]")
+            );
+
+    if cfg!(feature = "behind-proxy") {
+        parser = parser.arg(Arg::with_name("behind-proxy")
+        .long("behind-proxy")
+        .help("Informs program that it is behind remote proxy, now used only for logging (to get true remote client ip)")
+        )
+    }
 
     if cfg!(feature = "folder-download") {
         parser = parser.arg(
@@ -168,14 +198,23 @@ fn create_parser<'a>() -> Parser<'a> {
             );
     }
 
-    parser = parser.arg(
+    if cfg!(feature = "shared-positions") {
+        parser = parser.arg(
         Arg::with_name("positions-file")
             .long("positions-file")
             .takes_value(true)
             .validator_os(parent_dir_exists)
             .env("AUDIOSERVE_POSITIONS_FILE")
-            .help("File to save last listened positions"),
-    );
+            .help("File to save last listened positions []"),
+        )
+        .arg(
+            Arg::with_name("positions-ws-timeout")
+            .long("positions-ws-timeout")
+            .validator(is_number)
+            .env("AUDIOSERVE_POSITIONS_WS_TIMEOUT")
+            .help("Timeout in seconds for idle websocket connection use for playback position sharing [default 600s]")
+        );
+    }
 
     if cfg!(feature = "symlinks") {
         parser = parser.arg(
@@ -200,7 +239,7 @@ fn create_parser<'a>() -> Parser<'a> {
             .takes_value(true)
             .env("AUDIOSERVE_T_CACHE_DIR")
             .validator_os(parent_dir_exists)
-            .help("Directory for transcoding cache [default is 'audioserve-cache' under system wide temp dirrectory]")
+            .help("Directory for transcoding cache [default is ~/.audioserve/audioserve-cache]")
         ).arg(
             Arg::with_name("t-cache-size")
             .long("t-cache-size")
@@ -218,12 +257,13 @@ fn create_parser<'a>() -> Parser<'a> {
         ).arg(
             Arg::with_name("t-cache-disable")
             .long("t-cache-disable")
+            .conflicts_with_all(&["t-cache-save-often", "t-cache-max-files", "t-cache-size", "t-cache-dir"])
             .help("Transaction cache is disabled. If you want to completely get rid of it, compile without 'transcoding-cache'")
             )
         .arg(
             Arg::with_name("t-cache-save-often")
             .long("t-cache-save-often")
-            .help("Save additions to cache often, after each addition, this is normaly not necessary")
+            .help("Save additions to cache often, after each addition, this is normally not necessary")
         )
     }
 
@@ -346,6 +386,10 @@ where
         config.set_shared_secret_from_file(file)?
     };
 
+    if let Some(r) = args.value_of("limit-rate").and_then(|s| s.parse().ok()) {
+        config.limit_rate = Some(r)
+    }
+
     if let Some(n) = args.value_of("transcoding-max-parallel-processes") {
         config.transcoding.max_parallel_processes = n.parse().unwrap()
     }
@@ -427,6 +471,10 @@ where
         config.disable_folder_download = true
     };
 
+    if is_present_or_env("behind-proxy", "AUDIOSERVE_BEHIND_PROXY") {
+        config.behind_proxy = true;
+    }
+
     if let Some(d) = args.value_of("chapters-from-duration") {
         config.chapters.from_duration = d.parse().unwrap()
     }
@@ -435,8 +483,20 @@ where
         config.chapters.duration = d.parse().unwrap()
     }
 
+    if is_present_or_env("no-dir-collaps", "AUDIOSERVE_NO_DIR_COLLAPS") {
+        config.no_dir_collaps = true;
+    }
+
+    if is_present_or_env("ignore-chapters-meta", "AUDIOSERVE_IGNORE_CHAPTERS_META") {
+        config.ignore_chapters_meta = true;
+    }
+
     if let Some(positions_file) = args.value_of_os("positions-file") {
         config.positions_file = positions_file.into();
+    }
+
+    if let Some(positions_ws_timeout) = args.value_of("positions-ws-timeout") {
+        config.positions_ws_timeout = Duration::from_secs(positions_ws_timeout.parse().unwrap())
     }
 
     if !no_authentication_confirmed && config.shared_secret.is_none() {
@@ -445,6 +505,13 @@ where
             "Shared secret is None, but no authentication is not confirmed"
         );
     }
+
+    if let Some(s) = args
+        .value_of("url-path-prefix")
+        .map(std::string::ToString::to_string)
+    {
+        config.url_path_prefix = Some(s);
+    };
 
     config.check()?;
     if args.is_present("print-config") {
@@ -489,6 +556,8 @@ mod test {
             "--chapters-duration",
             "99",
             "--cors",
+            "--url-path-prefix",
+            "/user/audioserve",
             "test_data",
             "client",
         ])
@@ -507,6 +576,7 @@ mod test {
         assert_eq!(99, c.chapters.from_duration);
         assert_eq!(99, c.chapters.duration);
         assert!(c.cors);
+        assert_eq!("/user/audioserve", c.url_path_prefix.unwrap())
     }
 
     #[test]
@@ -522,7 +592,6 @@ mod test {
             "999",
             "--t-cache-max-files",
             "999",
-            "--t-cache-disable",
             "--t-cache-save-often",
             "test_data",
         ])
@@ -531,7 +600,7 @@ mod test {
         assert_eq!(PathBuf::from("test_data"), c.transcoding.cache.root_dir);
         assert_eq!(999, c.transcoding.cache.max_size);
         assert_eq!(999, c.transcoding.cache.max_files);
-        assert!(c.transcoding.cache.disabled);
+        assert!(!c.transcoding.cache.disabled);
         assert!(c.transcoding.cache.save_often);
     }
 
@@ -573,6 +642,8 @@ mod test {
         let c =
             parse_args_from(&["audioserve", "--config", "test_data/sample-config.yaml"]).unwrap();
 
-        assert_eq!("neco", c.ssl.unwrap().key_password);
+        assert_eq!("neco", c.ssl.as_ref().unwrap().key_password);
+        assert_eq!(Some("asecret".into()), c.shared_secret);
+        assert_eq!(Some("/user/audioserve".into()), c.url_path_prefix);
     }
 }

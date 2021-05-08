@@ -20,6 +20,14 @@ pub fn is_number(v: String) -> ValidatorResult {
     Ok(())
 }
 
+pub fn is_positive_float(v: String) -> ValidatorResult {
+    let x: f32 = v.parse().map_err(|_| format!("{} is not a number", v))?;
+    if x < 1e-18 {
+        return Err("Number should be bigger then 0 at least by small bit".into());
+    }
+    Ok(())
+}
+
 pub fn is_existing_dir(p: &OsStr) -> Result<(), OsString> {
     let p = Path::new(p);
     if !p.is_dir() {
@@ -43,5 +51,13 @@ pub fn parent_dir_exists(p: &OsStr) -> Result<(), OsString> {
         Err(format!("parent dir for {:?} does not exists", p).into())
     } else {
         Ok(())
+    }
+}
+
+pub fn is_valid_url_path_prefix(s: String) -> ValidatorResult {
+    if s.starts_with('/') && !s.ends_with('/') {
+        Ok(())
+    } else {
+        Err("Must start with / but not end with it".into())
     }
 }

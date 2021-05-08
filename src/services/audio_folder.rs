@@ -1,4 +1,4 @@
-use std::borrow;
+use std::borrow::{self, Cow};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -22,7 +22,7 @@ pub fn list_dir<P: AsRef<Path>, P2: AsRef<Path>>(
         DirType::File {
             chapters,
             audio_meta,
-        } => list_dir_file(base_dir, full_path, audio_meta, chapters),
+        } => list_dir_file(base_dir, full_path, audio_meta, chapters, false),
         DirType::Other => Err(io::Error::new(
             io::ErrorKind::Other,
             "Not folder or chapterised audio file",
@@ -173,43 +173,86 @@ fn chapters_from_csv(path: &Path) -> Result<Option<Vec<Chapter>>, io::Error> {
     Ok(None)
 }
 
-fn path_for_chapter(p: &Path, chap: &Chapter) -> PathBuf {
+fn path_for_chapter(p: &Path, chap: &Chapter, collapse: bool) -> io::Result<PathBuf> {
     let ext = p
         .extension()
         .and_then(OsStr::to_str)
         .map(|e| ".".to_owned() + e)
         .unwrap_or_else(|| "".to_owned());
+
     let pseudo_file = format!(
         "{:03} - {}$${}-{}$${}",
         chap.number, chap.title, chap.start, chap.end, ext
     );
-    p.join(pseudo_file)
+    let (base, file_name) = if collapse {
+        let base = p.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Cannot create path for chapter (no parent) in {:?}", p),
+            )
+        })?;
+        let mut f = p
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!(
+                        "Cannot create path for chapter (invalid file name) in {:?}",
+                        p
+                    ),
+                )
+            })?
+            .to_string();
+        f.push_str("$$");
+        f.push_str(&pseudo_file);
+        (base, f)
+    } else {
+        (p, pseudo_file)
+    };
+
+    if file_name.len() > 255 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Chapter file name too long",
+        ));
+    }
+
+    Ok(base.join(file_name))
 }
 
 lazy_static! {
-    static ref CHAPTER_PSEUDO_RE: Regex = Regex::new(r"\$\$(\d+)-(\d*)\$\$").unwrap();
+    static ref CHAPTER_PSEUDO_RE: Regex = Regex::new(r"\$\$(\d+)-(\d+)\$\$").unwrap();
 }
 
-pub fn parse_chapter_path(p: &Path) -> (&Path, Option<TimeSpan>) {
+pub fn parse_chapter_path(p: &Path) -> (Cow<Path>, Option<TimeSpan>) {
     let fname = p.file_name().and_then(OsStr::to_str);
     if let Some(fname) = fname {
         if let Some(cap) = CHAPTER_PSEUDO_RE.captures(fname) {
+            let start_index = cap.get(0).unwrap().start();
             let start: u64 = cap.get(1).unwrap().as_str().parse().unwrap();
             let end: Option<u64> = cap.get(2).and_then(|g| g.as_str().parse().ok());
             let duration = end.map(|end| end - start);
             let parent = p.parent().unwrap_or_else(|| Path::new(""));
-            return (parent, Some(TimeSpan { start, duration }));
+            let path = match fname.find("$$") {
+                Some(pos) if pos < start_index => Cow::Owned(parent.join(&fname[..pos])),
+                _ => Cow::Borrowed(parent),
+            };
+
+            return (path, Some(TimeSpan { start, duration }));
         }
     };
 
-    (p, None)
+    (Cow::Borrowed(p), None)
 }
 
+#[allow(clippy::unnecessary_wraps)] // actually as its used in match with function returning results it's better to have Result return type
 fn list_dir_file<P: AsRef<Path>>(
     base_dir: P,
     full_path: PathBuf,
     audio_meta: AudioMeta,
     chapters: Vec<Chapter>,
+    collapse: bool,
 ) -> Result<AudioFolder, io::Error> {
     let path = full_path.strip_prefix(&base_dir).unwrap();
     let mime = guess_mime_type(&path);
@@ -222,18 +265,18 @@ fn list_dir_file<P: AsRef<Path>>(
                     duration: ((chap.end - chap.start) / 1000) as u32,
                 }
             };
-            AudioFile {
+            Ok(AudioFile {
                 meta: Some(new_meta),
-                path: path_for_chapter(path, &chap),
+                path: path_for_chapter(path, &chap, collapse)?,
                 name: format!("{:03} - {}", chap.number, chap.title).into(),
                 section: Some(FileSection {
                     start: chap.start,
                     duration: Some(chap.end - chap.start),
                 }),
                 mime: mime.to_string(),
-            }
+            })
         })
-        .collect();
+        .collect::<io::Result<Vec<_>>>()?;
 
     Ok(AudioFolder {
         files,
@@ -285,7 +328,7 @@ fn list_dir_dir<P: AsRef<Path>>(
                                         }
                                     };
 
-                                    if let Some(_chapters) = meta.get_chapters() {
+                                    if !get_config().ignore_chapters_meta && meta.has_chapters() {
                                         // we do have chapters so let present this file as folder
                                         subfolders.push(AudioFolderShort::from_dir_entry(
                                             &f, path, ordering, true,
@@ -294,10 +337,8 @@ fn list_dir_dir<P: AsRef<Path>>(
                                         let meta = meta.get_audio_info();
                                         if is_long_file((&meta).as_ref())
                                             || chapters_file_path(&audio_file_path)
-                                                .and_then(
-                                                    |p| if p.is_file() { Some(()) } else { None },
-                                                )
-                                                .is_some()
+                                                .map(|p| p.is_file())
+                                                .unwrap_or(false)
                                         {
                                             // file is bigger then limit present as folder
                                             subfolders.push(AudioFolderShort::from_dir_entry(
@@ -330,8 +371,32 @@ fn list_dir_dir<P: AsRef<Path>>(
                     ),
                 }
             }
-            files.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-            subfolders.sort_unstable_by(|a, b| a.compare_as(ordering, b));
+            // if we have just one chapterized audiobook, let's include it into current directory
+            if !get_config().no_dir_collaps
+                && files.is_empty()
+                && subfolders.len() == 1
+                && subfolders[0].is_file
+            {
+                let full_path = base_dir.as_ref().join(subfolders.pop().unwrap().path);
+                match get_dir_type(&full_path)? {
+                    DirType::File {
+                        chapters,
+                        audio_meta,
+                    } => {
+                        let f = list_dir_file(base_dir, full_path, audio_meta, chapters, true)?;
+                        files = f.files;
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("Expecting chapterized file on {:?}", full_path),
+                        ))
+                    }
+                }
+            } else {
+                files.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+                subfolders.sort_unstable_by(|a, b| a.compare_as(ordering, b));
+            }
 
             Ok(AudioFolder {
                 files,
@@ -473,19 +538,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pseudo_file() {
-        let fname = format!(
-            "kniha/{:3} - {}$${}-{}$${}",
-            1, "Usak Jede", 1234, 5678, ".opus"
-        );
-        let (p, span) = parse_chapter_path(Path::new(&fname));
-        let span = span.unwrap();
-        assert_eq!(Path::new("kniha"), p);
-        assert_eq!(span.start, 1234);
-        assert_eq!(span.duration, Some(5678u64 - 1234));
-    }
-
-    #[test]
     fn test_chapters_file() {
         //env_logger::init();
         let path = Path::new("./test_data/01-file.mp3");
@@ -503,5 +555,57 @@ mod tests {
             Some((1000f32 * (2f32 * 3600f32 + 35f32 * 60f32 + 1.1)) as u64),
             ms_from_time("02:35:01.1")
         );
+    }
+
+    #[test]
+    fn test_create_pseudofile_name() {
+        let chap = Chapter {
+            number: 1,
+            title: "Chapter1".into(),
+            start: 1000,
+            end: 2000,
+        };
+
+        let p = PathBuf::from("stoker/dracula/dracula.m4b");
+        let pseudo = path_for_chapter(&p, &chap, false).unwrap();
+        assert_eq!(
+            pseudo.to_str().unwrap(),
+            "stoker/dracula/dracula.m4b/001 - Chapter1$$1000-2000$$.m4b"
+        );
+        let pseudo = path_for_chapter(&p, &chap, true).unwrap();
+        assert_eq!(
+            pseudo.to_str().unwrap(),
+            "stoker/dracula/dracula.m4b$$001 - Chapter1$$1000-2000$$.m4b"
+        );
+    }
+
+    #[test]
+    fn test_pseudo_file() {
+        let fname = format!(
+            "kniha/{:3} - {}$${}-{}$${}",
+            1, "Usak Jede", 1234, 5678, ".opus"
+        );
+        let (p, span) = parse_chapter_path(Path::new(&fname));
+        let span = span.unwrap();
+        assert_eq!(Path::new("kniha"), p);
+        assert_eq!(span.start, 1234);
+        assert_eq!(span.duration, Some(5678u64 - 1234));
+    }
+
+    #[test]
+    fn test_pseudo_file2() {
+        let f = "stoker/dracula/dracula.m4b/001 - Chapter1$$1000-2000$$.m4b";
+        let (p, span) = parse_chapter_path(Path::new(f));
+        let span = span.unwrap();
+        assert_eq!(p.to_str().unwrap(), "stoker/dracula/dracula.m4b");
+        assert_eq!(span.start, 1000);
+        assert_eq!(span.duration.unwrap(), 1000);
+
+        let f = "stoker/dracula/dracula.m4b$$001 - Chapter1$$1000-2000$$.m4b";
+        let (p, span) = parse_chapter_path(Path::new(f));
+        let span = span.unwrap();
+        assert_eq!(p.to_str().unwrap(), "stoker/dracula/dracula.m4b");
+        assert_eq!(span.start, 1000);
+        assert_eq!(span.duration.unwrap(), 1000);
     }
 }

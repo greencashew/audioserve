@@ -1,6 +1,6 @@
 [package]
 name = "audioserve"
-version = "0.12.2"
+version = "0.15.4"
 authors = ["Ivan <ivan.zderadicka@gmail.com>"]
 edition = "2018"
 
@@ -8,9 +8,10 @@ edition = "2018"
 members = ["crates/*"]
 
 [dependencies]
-env_logger = "0.7"
+bytes = "1.0"
+env_logger = "0.8"
 log = {version="0.4", features = ["release_max_level_info"]}
-hyper = "0.13"
+hyper = {version="0.14", features = ["full"]}
 headers = "0.3"
 futures = "0.3"
 mime = "0.3"
@@ -23,59 +24,64 @@ clap = "2"
 lazy_static = "1.4"
 thiserror = "1.0"
 anyhow = "1.0"
-url = "2.1"
+url = "2.2"
 percent-encoding = "2.1"
-num_cpus = "1.12"
+num_cpus = "1.13"
 ring = "0.16"
-data-encoding = "2.1"
-regex = "1.1"
-tokio = {version="0.2", features=["full"]}
+data-encoding = "2.3"
+regex = "1.4"
+tokio = {version="1.2", features=["full"]}
 
-dirs = "2.0"
+dirs = "3.0"
 csv = "1.1"
 unicase = "2.6"
 unicase_serde = "0.1.0"
-linked-hash-map = {git="https://github.com/izderadicka/linked-hash-map.git", features=["serde_impl"]}
+linked-hash-map = {git="https://github.com/izderadicka/linked-hash-map.git", version="0.5.3", features=["serde_impl"]}
 
-# for ssl
-tokio-tls = {version="0.3", optional=true}
+# for tls
+tokio-native-tls = {version="0.3", optional=true}
 native-tls = {version="0.2", optional=true}
 
 cachedirtree = {path="crates/cachedirtree", optional=true}
 
-bytes = {version="0.5", optional=true}
+leaky-cauldron = {path="crates/leaky-cauldron"}
 
-tokio-util = {version="0.2", optional=true}
+tokio-util = {version="0.6", optional=true}
 
+# this repo dependencies
 media_info = {path="crates/media_info"}
-
-[dependencies.simple-file-cache]
-path="crates/file-cache"
-features=["asynch"]
-optional=true
-
-[dependencies.async-tar]
-path="crates/async-tar"
-optional=true
-
-[dependencies.websock]
-path="crates/websock"
-optional = true
+proxy-headers = {path="crates/proxy-headers", optional=true}
+simple-file-cache = {path="crates/file-cache", features=["asynch"], optional=true }
+async-tar = {path="crates/async-tar", optional=true}
+async-zip = {path="crates/async-zip", optional=true}
+websock = {path="crates/websock", optional = true}
 
 [target.'cfg(unix)'.dependencies]
-nix = "0.17"
+nix = "0.19"
 
 [features]
 default = ["tls", "symlinks","search-cache", "folder-download", "shared-positions"]
-tls=["tokio-tls", "native-tls"]
+# default
+tls=["tokio-native-tls", "native-tls"]
 symlinks=["cachedirtree/symlinks"]
 search-cache=["cachedirtree"]
-transcoding-cache=["simple-file-cache", "bytes", "tokio-util"]
-folder-download = ["async-tar"]
-static = ["media_info/static"]
-partially-static = ["media_info/partially-static"]
+folder-download = ["async-tar", "async-zip"]
+folder-download-default-tar =[]
 shared-positions = ["websock"]
+# non-default
+transcoding-cache=["simple-file-cache", "tokio-util"]
+behind-proxy = ["proxy-headers"]
+# for static compilation only
+partially-static = ["media_info/partially-static"]
+static = ["media_info/static"]
+
+
+
 
 [profile.release]
 lto = true
 codegen-units = 1
+
+[dev-dependencies]
+reqwest = {version="0.11", features=['blocking', 'json']}
+escargot = "0.5" 

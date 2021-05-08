@@ -26,7 +26,7 @@ Salted shared secret is calculated as:
 
 * shared secret is encoded as UTF-8 bytes
 * client generates 32 random bytes
-* secret is concatated with random bytes (secret+random_bytes)
+* secret is concatenated with random bytes (secret+random_bytes)
 * these bytes are hashed with SHA-256
 * random bytes are encoded with base64 encoding
 * hash is encoded with base64 encoding
@@ -151,16 +151,26 @@ using path `/folder/` + `path` (for collection 0) or `/x/folder/` + `path` (for 
 `files` contains playable files -  `path` should be used with `audio` endpoint - see below - in similar way as in listing subfolders.  `meta` contains some metadata about audio file - `duration` in seconds and `bitrate` in kbps. `mime` is mime type
 of the audio file and `section` is only used with chapters extracted from single file audiobook (then it contains `start` and `duration` of the chapters in ms).
 
-`subfolders` entries contain also field `is_file`, which is true for single file audibooks that are presented as folders. 
+`subfolders` entries contain also field `is_file`, which is true for single file chaptered audibooks (.m4b format for instance) that are presented as folders. Listing of such file's chapters is done via this endpoint.  The only difference against regular directory is that artificial file entries are created for chapters - name is chapter name and path is in form `path/to/audiobook.m4b/Chapter_name$$1000-2000$$.m4b`, where numbers between `$$` are start and end of the chapter in milliseconds. There is also alternative form of path when containing directory is collapsed/skipped `path/to/audiobook.m4b$$Chapter_name$$1000-2000$$.m4b` using `$$` separator. Also each such file has data in `section` key with start of chapter and its duration in milliseconds. Here is example of such entry:
+
+```json
+{
+    "name":"000 - Chapter_1",
+    "path":"Stoker Bram/Dracula/Dracula.m4b>>000 - Chapter_1$$0-1020288$$.m4b",
+    "meta":{"duration":1020,"bitrate":54},
+    "mime":"audio/m4b",
+    "section":{"start":0,"duration":1020288}}
+```
 
 Folder can contain additional information `cover`, which is cover image (first .jpg or .png file encountered in the folder) and text information `description` (first .txt, .html, .md file encoutered in the folder). Both can be null, if there is no appropriate file and if not null, file can be retrieved in appropriate API end point by using the `path`.
+
 
 **download**
 
 Sample URL: https://your_server_name:3000/download/author_name/audio_book  
-Sample URL: https://your_server_name:3000/1/download/author_name/audio_book
+Sample URL: https://your_server_name:3000/1/download/author_name/audio_book?fmt=tar
 
-Downloads all files (audio files, cover, description) from this folder as a tar archive. The path to folder is same as in folder list endpoint `folder` - so it can start with collection number.
+Downloads all files (audio files, cover, description) from this folder as an archive. The path to folder is same as in folder list endpoint `folder` - so it can start with collection number. Default format of the archive is zip, tar archive is also supported - format can be chosen by `fmt` query parameter (values `tar` or `zip`). Also if you want to change default format by compiling audioserve with `folder-download-default-tar` feature.
 
 This endpoint can be disabled, if audioserve is compiled without default feature `folder-download` or with command line argument `--disable-folder-download` .
 
@@ -199,13 +209,13 @@ Lists top 64 most recent folders in the collection (based on folder modification
 
 **audio**
 
-Sample URL: https://your_server_name:3000/folder/Doyle Arthur Conan/5 pomerancovych jaderek.mp3  
-Sample URL: https://your_server_name:3000/folder/Doyle Arthur Conan/5 pomerancovych jaderek.mp3?trans=m  
-Sample URL: https://your_server_name:3000/folder/Doyle Arthur Conan/5 pomerancovych jaderek.mp3?trans=m&seek=537.42  
-Sample URL: https://your_server_name:3000/2/folder/author_name/series_name/audiobook_name/chapter1.opus
+Sample URL: https://your_server_name:3000/audio/Doyle Arthur Conan/5 pomerancovych jaderek.mp3  
+Sample URL: https://your_server_name:3000/audio/Doyle Arthur Conan/5 pomerancovych jaderek.mp3?trans=m  
+Sample URL: https://your_server_name:3000/audio/Doyle Arthur Conan/5 pomerancovych jaderek.mp3?trans=m&seek=537.42  
+Sample URL: https://your_server_name:3000/2/audio/author_name/series_name/audiobook_name/chapter1.opus
 
-This endpoint allows to access audio file, either as it is stored (in this case [http bytes range](https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests) is supported - but only one range per response)  
-or transcoded (in this case response content is [chunck encoded](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Transfer-Encoding) and its length is not known in advance). 
+This endpoint allows to access audio file, either as it is stored audio file (in this case [http bytes range](https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests) is supported - but only one range per response)  
+or transcoded content of the file (in this case response content is [chunck encoded](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Transfer-Encoding) and its length is not known in advance). 
 It's responsibility of client to choose direct or transcoded content as needed. 
 
 Transcoding is triggered by query string paramater `trans`, which can have one of three possible values `l` (Low profile), 
@@ -252,6 +262,14 @@ Client sends simple text message:
 Example of such message is (group here is name of group, can be anything):
 
     480.383|group/0/Adams Douglas/Douglas Adams - Stoparuv pruvodce galaxii (2008)/01.kapitola.mp3
+
+Client can send also longer form of this message:
+
+    playback_time_secs|group_name/collection_number/audio_file_path|timestamp
+
+This longer form is useful, if connection is interrupt and client wants to report on position which was reached in past (however it's taken into consideration if there is no newer position in the group). Timestamp is unix time in seconds. Example of such message:
+
+    480.383|group/0/Adams Douglas/Douglas Adams - Stoparuv pruvodce galaxii (2008)/01.kapitola.mp3|1614963001
 
 Such message can be send also in short form, without  `group_name/collection_number/audio_file_path`, if we are continuing to report position in same audio file. So next position update could be just:
 
