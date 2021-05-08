@@ -1,4 +1,4 @@
-name: Fork auto synchronisation
+name: Fork auto synchronization
 
 on:
   schedule:
@@ -6,9 +6,7 @@ on:
 
 jobs:
   sync:
-
     runs-on: ubuntu-latest
-
     steps:
       - uses: TG908/fork-sync@v1.1
         with:
