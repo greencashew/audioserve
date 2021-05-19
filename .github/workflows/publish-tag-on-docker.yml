@@ -6,6 +6,13 @@ on:
       - 'v*.*.*'
   release:
     types: [published, created, edited]
+  fork:
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    tags:
+      - 'v*.*.*'
+
 jobs:
   test:
     runs-on: ubuntu-latest
