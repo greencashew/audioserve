@@ -1,7 +1,7 @@
 name: Fork auto synchronization
 on:
   schedule:
-    - cron:  '* * * * *'
+    - cron: '0 21 * * *'
   workflow_dispatch:
 
 jobs:
@@ -21,11 +21,8 @@ jobs:
           echo "Fetching tmp_upstream"
           git fetch tmp_upstream --quiet
           git remote --verbose
-          git checkout tmp_upstream/master
-          git pull origin master
-
-          echo "Pushing changes from tmp_upstream to origin"
-          git push origin "refs/remotes/tmp_upstream/master:refs/heads/master"
+          git rebase tmp_upstream/master
+          git push origin
 
           git tag -d $(git tag -l) > /dev/null
           git fetch tmp_upstream --tags --quiet
