@@ -12,6 +12,7 @@ on:
   pull_request:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
 
 jobs:
   test:
