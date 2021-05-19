@@ -1,11 +1,10 @@
 Audioserve
 ==========
 
-**!!PLEASE UPDATE TO v0.15.0 (or newer) DUE TO IMPORTANT SECURITY FIX!!**
+[![Build Status](https://travis-ci.org/izderadicka/audioserve.svg?branch=master)](https://travis-ci.org/izderadicka/audioserve) 
+[![Docker Pulls](https://img.shields.io/docker/pulls/izderadicka/audioserve)](https://hub.docker.com/repository/docker/izderadicka/audioserve)
 
 [ [**DEMO AVAILABLE** - shared secret: mypass] ](https://audioserve.zderadicka.eu)
-[![Build Status](https://travis-ci.org/izderadicka/audioserve.svg?branch=master)](https://travis-ci.org/izderadicka/audioserve)
-
 
 Simple personal server to serve audio files from directories. Intended primarily for audio books, but anything with decent directories structure will do. Focus here is on simplicity and minimalistic design.
 
@@ -66,9 +65,9 @@ Proper functioning is (indeed) dependent on good connectivity -  as position is 
 Security
 --------
 
-Audioserve is not writing anything to your media library, so read only access is OK. However you should assume that any file in publish media directories can be accessible via audioserve API (thought recently name starting with . (hidden files/directories) are blocked) so basically to anybody who can obtain shared secret (or in case you use `--no-authentication` then to anybody).
+Audioserve is not writing anything to your media library, so read only access is OK. However you should assume that any file in published media directories can be accessible via audioserve API (thought recently name starting with . (hidden files/directories) are blocked) so basically to anybody who can obtain shared secret (or in case you use `--no-authentication` then to anybody).
 
-The only file where it needs to write is a file were it keeps its secret key for authentication (by default in `~/.audioserve/audioserve.secret`, but it can be specified by command line argument). And optionaly it writes files to transcoding cache ([see below](#transcoding-cache)) and positions file.
+Write access is need to file were it keeps its secret key for authentication (by default in `~/.audioserve/audioserve.secret`,  its locations can be changed by command line argument `--secret-file`) - this file should have exclusive rw access for user running audioserve (this is how file is created, so no special action is needed). Another file, which requires write access, is positions file (used for shared position synchronization, if not needed compile audioserve without `shared-positions` feature) by default in `~/.audioserve/audioserve.positions`. Optionally, if feature `transcoding-cache` ([see below](#transcoding-cache)) is enabled (during compilation) cache directory (by default in `~/.audioserve/audioserve-cache`) has to have write rights too. As you can see by default write access is needed to directory `~/.audioserve/`. This directory for all writeable files can be changed by `--data-dir` argument (which can be quite useful if you run audioserve in docker container with a specified user).
 
 Authentication is done by shared secret phrase (supplied to server on command line or more securely via environment variable), which clients must know.
 Shared secret phrase is never sent in plain (it's sent as salted hash). If correct shared secret hash is provided by client, sever generates a token, using its secret key, which is then used for individual requests authentication.  Token then can be used in cookie or HTTP Authorization header (Bearer method).
@@ -111,6 +110,7 @@ Number of parallel transcodings (transcodings are most resource intensive tasks)
 - Always SSL/TLS - ideally behind well proven reverse proxy (I'm using nginx) (audioserve has support for SSL/TLS, but reverse proxy is probably more solid, plus can provide additional safeguards)
 - Set solid shared secret 10+ different character types ... (to prevent guessing and brute force attacks), do not run on Internet with `no-authentication` - it's for testing only
 - Never run audioserve as root
+- Keep audioserve updated - as I'm addressing found issues in new releases (definitely do not use older version v0.15.0, which addressed important fix)
 - in $HOME/.audoserve are couple of files that are writable by server - so they should have proper permissions - especially `audioserve.secret` should be be limited to user (running audioserve) access only
 - Never put any secret information into media directories - all content of these directories is potentially accessible via Web API.
 - Running in dedicated container also improves security
