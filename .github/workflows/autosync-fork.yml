@@ -21,7 +21,7 @@ jobs:
           echo "Fetching tmp_upstream"
           git fetch tmp_upstream --quiet
           git remote --verbose
-          git rebase tmp_upstream/master
+          git merge tmp_upstream/master
           git push origin
 
           git tag -d $(git tag -l) > /dev/null
