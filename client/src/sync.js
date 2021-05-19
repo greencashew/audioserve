@@ -18,8 +18,21 @@ class PlaybackSync {
         this.socketUrl = baseUrl + (baseUrl.endsWith("/") ? "" : "/") + "position";
         this.closed = false;
         this.filePath = null;
-        this.groupPrefix = null;
+        this._groupPrefix = null;
         this.failures = 0;
+        this._enabled = true;
+    }
+
+    get groupPrefix() {
+        return this._enabled ? this._groupPrefix : null;
+    }
+
+    set groupPrefix(v) {
+        this._groupPrefix = v;
+    }
+
+    disable() {
+        this._enabled = false;
     }
 
     open() {
@@ -90,6 +103,7 @@ class PlaybackSync {
             window.clearTimeout(this.pendingPositionTimeout);
             this.pendingPositionTimeout = null;
         }
+        if (!this.groupPrefix) return;
         if (!this.active) {
             this.pendingPosition = {
                 filePath,
@@ -153,7 +167,7 @@ class PlaybackSync {
 
         }
 
-        if (this.active) {
+        if (this.groupPrefix && this.active) {
             const p = this._makeQueryPromise();
             this.socket.send(folderPath ? this.groupPrefix + folderPath : "?");
             return p;
