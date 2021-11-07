@@ -1,0 +1,21 @@
+name: Deploy Demo Audioserve
+
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: ssh to VM and redeploy
+        uses: appleboy/ssh-action@master
+        with:
+          host: audioserve.zderadicka.eu
+          username: ${{ secrets.AUDIOSERVE_USERNAME }}
+          key: ${{ secrets.AUDIOSERVE_KEY }}
+          script: |
+            docker rm -f audioserve || true
+            docker pull izderadicka/audioserve:unstable
+            ./run-audioserve.sh

@@ -1,27 +1,10 @@
 use headers::{Header, HeaderMapExt};
 use hyper::http::response::Builder;
-use mime_guess::{self, Mime};
 use std::cmp::{max, min};
-use std::fs::DirEntry;
 use std::{
-    io,
     ops::{Bound, RangeBounds},
     path::Path,
 };
-
-pub fn guess_mime_type<P: AsRef<Path>>(path: P) -> Mime {
-    mime_guess::from_path(path).first_or_octet_stream()
-}
-
-pub fn os_to_string(s: ::std::ffi::OsString) -> String {
-    match s.into_string() {
-        Ok(s) => s,
-        Err(s) => {
-            warn!("Invalid file name - cannot covert to UTF8 : {:?}", s);
-            "INVALID_NAME".into()
-        }
-    }
-}
 
 pub fn parent_dir_exists<P: AsRef<Path>>(p: &P) -> bool {
     match p.as_ref().parent() {
@@ -90,36 +73,6 @@ impl ResponseBuilderExt for Builder {
     }
 }
 
-#[cfg(feature = "symlinks")]
-pub fn get_real_file_type<P: AsRef<Path>>(
-    dir_entry: &DirEntry,
-    full_path: P,
-    allow_symlinks: bool,
-) -> Result<::std::fs::FileType, io::Error> {
-    let ft = dir_entry.file_type()?;
-
-    if allow_symlinks && ft.is_symlink() {
-        let p = std::fs::read_link(dir_entry.path())?;
-        let ap = if p.is_relative() {
-            full_path.as_ref().join(p)
-        } else {
-            p
-        };
-        Ok(ap.metadata()?.file_type())
-    } else {
-        Ok(ft)
-    }
-}
-
-#[cfg(not(feature = "symlinks"))]
-pub fn get_real_file_type<P: AsRef<Path>>(
-    dir_entry: &DirEntry,
-    _full_path: P,
-    _allow_symlinks: bool,
-) -> Result<::std::fs::FileType, io::Error> {
-    dir_entry.file_type()
-}
-
 /// Checks whether the pattern matches at the front of the haystack.
 #[inline]
 fn is_prefix_of(needle: &str, haystack: &str) -> bool {
@@ -135,4 +88,10 @@ pub fn strip_prefix_of<'a>(needle: &str, haystack: &'a str) -> Option<&'a str> {
     } else {
         None
     }
+}
+
+#[cfg(feature = "shared-positions")]
+pub fn parse_cron<S: AsRef<str>>(exp: S) -> crate::error::Result<cron::Schedule> {
+    let exp = format!("0 {} *", exp.as_ref());
+    exp.parse().map_err(crate::Error::from)
 }

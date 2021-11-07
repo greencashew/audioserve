@@ -1,11 +1,13 @@
 pub use self::error::{Error, Result};
 use super::services::transcode::{QualityLevel, Transcoder, TranscodingFormat};
 use crate::util;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 mod cli;
@@ -241,11 +243,88 @@ impl SslConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaseDirOptions {
+    pub no_cache: bool,
+}
+
+impl FromStr for BaseDirOptions {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "nc" | "no-cache" => Ok(BaseDirOptions { no_cache: true }),
+            _ => return value_error!("base_dir", format!("invalid option {}", s)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PositionsBackupFormat {
+    None,
+    Legacy,
+    V1,
+}
+
+impl FromStr for PositionsBackupFormat {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "legacy" => Ok(PositionsBackupFormat::Legacy),
+            "v1" => Ok(PositionsBackupFormat::V1),
+            _ => Err(Error::ConfigValue {
+                name: "positions-restore",
+                message: "Invalid version".into(),
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "shared-positions")]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PositionsConfig {
+    pub ws_timeout: Duration,
+    pub backup_file: Option<PathBuf>,
+    pub restore: PositionsBackupFormat,
+    pub backup_schedule: Option<String>,
+}
+
+#[cfg(feature = "shared-positions")]
+impl Default for PositionsConfig {
+    fn default() -> Self {
+        Self {
+            ws_timeout: Duration::from_secs(600),
+            backup_file: None,
+            restore: PositionsBackupFormat::None,
+            backup_schedule: None,
+        }
+    }
+}
+
+#[cfg(feature = "shared-positions")]
+impl PositionsConfig {
+    pub fn check(&self) -> Result<()> {
+        if self.ws_timeout < Duration::from_secs(60) {
+            return value_error!("positions-ws-timeout", "Timeout must be at least 60s");
+        }
+
+        if let Some(schedule) = self.backup_schedule.as_ref() {
+            if crate::util::parse_cron(schedule).is_err() {
+                return value_error!("positions-backup-schedule", "Invalid cron expression");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub listen: SocketAddr,
     pub thread_pool: ThreadPoolConfig,
     pub base_dirs: Vec<PathBuf>,
+    pub base_dirs_options: HashMap<PathBuf, BaseDirOptions>,
     pub url_path_prefix: Option<String>,
     pub shared_secret: Option<String>,
     pub limit_rate: Option<f32>,
@@ -261,9 +340,12 @@ pub struct Config {
     pub chapters: ChaptersSize,
     pub no_dir_collaps: bool,
     pub ignore_chapters_meta: bool,
-    pub positions_file: PathBuf,
-    pub positions_ws_timeout: Duration,
+    #[cfg(feature = "shared-positions")]
+    pub positions: PositionsConfig,
     pub behind_proxy: bool,
+    pub collections_cache_dir: PathBuf,
+    pub tags: HashSet<String>,
+    pub force_cache_update_on_init: bool,
 }
 
 impl Config {
@@ -271,10 +353,23 @@ impl Config {
         Transcoder::new(get_config().transcoding.get(transcoding_quality))
     }
 
-    pub fn add_base_dir<P: Into<PathBuf>>(&mut self, p: P) -> Result<()> {
-        let base_dir = p.into();
+    pub fn add_base_dir<P: AsRef<str>>(&mut self, p: P) -> Result<()> {
+        let mut parts = p.as_ref().splitn(2, ':');
+        let base_dir = parts
+            .next()
+            .map(PathBuf::from)
+            .ok_or_else(|| Error::ConfigValue {
+                name: "base_dir",
+                message: "Empty base_dir".into(),
+            })?;
+
         if !base_dir.is_dir() {
             return value_error!("base_dir", "{:?} is not direcrory", base_dir);
+        }
+
+        if let Some(options) = parts.next() {
+            let options: BaseDirOptions = options.parse()?;
+            self.base_dirs_options.insert(base_dir.clone(), options);
         }
         self.base_dirs.push(base_dir);
         Ok(())
@@ -325,10 +420,6 @@ impl Config {
             );
         }
 
-        if self.positions_ws_timeout < Duration::from_secs(60) {
-            return value_error!("positions-ws-timeout", "Timeout must be at least 60s");
-        }
-
         if !self.client_dir.is_dir() {
             return value_error!(
                 "client_dir",
@@ -345,14 +436,6 @@ impl Config {
             );
         };
 
-        if !util::parent_dir_exists(&self.positions_file) {
-            return value_error!(
-                "positions_file",
-                "Parent directory for does not exists for {:?}",
-                self.positions_file
-            );
-        };
-
         if self.ssl.is_some() {
             self.ssl.as_ref().unwrap().check()?
         }
@@ -360,6 +443,8 @@ impl Config {
         self.transcoding.check()?;
         self.thread_pool.check()?;
         self.chapters.check()?;
+        #[cfg(feature = "shared-positions")]
+        self.positions.check()?;
 
         if self.base_dirs.is_empty() {
             return value_error!(
@@ -382,6 +467,14 @@ impl Config {
 
         Ok(())
     }
+
+    pub fn get_tags(&self) -> Option<HashSet<String>> {
+        if self.tags.is_empty() {
+            None
+        } else {
+            Some(self.tags.clone())
+        }
+    }
 }
 
 impl Default for Config {
@@ -389,6 +482,7 @@ impl Default for Config {
         let data_base_dir = base_data_dir();
         Config {
             base_dirs: vec![],
+            base_dirs_options: HashMap::new(),
             url_path_prefix: None,
             listen: ([0, 0, 0, 0], 3000u16).into(),
             thread_pool: ThreadPoolConfig::default(),
@@ -406,9 +500,12 @@ impl Default for Config {
             chapters: ChaptersSize::default(),
             no_dir_collaps: false,
             ignore_chapters_meta: false,
-            positions_file: data_base_dir.join("audioserve.positions"),
-            positions_ws_timeout: Duration::from_secs(600),
             behind_proxy: false,
+            collections_cache_dir: data_base_dir.join("col_db"),
+            tags: HashSet::new(),
+            force_cache_update_on_init: false,
+            #[cfg(feature = "shared-positions")]
+            positions: Default::default(),
         }
     }
 }

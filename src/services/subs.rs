@@ -1,20 +1,17 @@
-#[cfg(feature = "folder-download")]
-use super::audio_folder::list_dir_files_only;
+//#[cfg(feature = "folder-download")]
 use super::{
-    audio_folder::{list_dir, parse_chapter_path},
     resp,
     search::{Search, SearchTrait},
-    transcode::{guess_format, AudioFilePath, QualityLevel, TimeSpan},
+    transcode::{guess_format, AudioFilePath, QualityLevel},
     types::*,
     Counter,
 };
 use crate::{
     config::get_config,
     error::{Error, Result},
-    util::{
-        checked_dec, guess_mime_type, into_range_bounds, to_satisfiable_range, ResponseBuilderExt,
-    },
+    util::{checked_dec, into_range_bounds, to_satisfiable_range, ResponseBuilderExt},
 };
+use collection::{guess_mime_type, parse_chapter_path, FoldersOrdering, TimeSpan};
 use futures::prelude::*;
 use futures::{future, ready, Stream};
 use headers::{AcceptRanges, CacheControl, ContentLength, ContentRange, ContentType, LastModified};
@@ -25,7 +22,7 @@ use std::{
     io::{self, SeekFrom},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::atomic::Ordering,
+    sync::{atomic::Ordering, Arc},
     task::{Context, Poll},
 };
 use tokio::{
@@ -161,16 +158,22 @@ fn serve_file_transcoded_checked(
         transcoding.max_transcodings - running_transcodings,
         transcoding.max_transcodings
     );
-    serve_file_transcoded(full_path, seek, span, transcoding_quality, counter)
+    Box::pin(serve_file_transcoded(
+        full_path,
+        seek,
+        span,
+        transcoding_quality,
+        counter,
+    ))
 }
 
-fn serve_file_transcoded(
+async fn serve_file_transcoded(
     full_path: AudioFilePath<PathBuf>,
     seek: Option<f32>,
     span: Option<TimeSpan>,
     transcoding_quality: QualityLevel,
     counter: Counter,
-) -> ResponseFuture {
+) -> Result<Response> {
     let transcoder = get_config().transcoder(transcoding_quality);
     let params = transcoder.transcoding_params();
     let mime = if let QualityLevel::Passthrough = transcoding_quality {
@@ -179,22 +182,30 @@ fn serve_file_transcoded(
         transcoder.transcoded_mime()
     };
 
-    let fut = transcoder
+    // check if file exists
+
+    if !tokio::fs::metadata(full_path.as_ref())
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
+        error!(
+            "Requesting non existent file for transcoding {:?}",
+            full_path
+        );
+        return Ok(resp::not_found());
+    }
+
+    transcoder
         .transcode(full_path, seek, span, counter.clone(), transcoding_quality)
-        .then(move |res| match res {
-            Ok(stream) => future::ok(
-                HyperResponse::builder()
-                    .typed_header(ContentType::from(mime))
-                    .header("X-Transcode", params.as_bytes())
-                    .body(Body::wrap_stream(stream.map_err(Error::new)))
-                    .unwrap(),
-            ),
-            Err(e) => {
-                error!("Cannot create transcoded stream, error: {}", e);
-                future::ok(resp::internal_error())
-            }
-        });
-    Box::pin(fut)
+        .await
+        .map(move |stream| {
+            HyperResponse::builder()
+                .typed_header(ContentType::from(mime))
+                .header("X-Transcode", params.as_bytes())
+                .body(Body::wrap_stream(stream))
+                .unwrap()
+        })
 }
 
 pub struct ChunkStream<T> {
@@ -378,12 +389,14 @@ pub fn send_file<P: AsRef<Path>>(
 }
 
 pub fn get_folder(
-    base_path: &'static Path,
+    collection: usize,
     folder_path: PathBuf,
+    collections: Arc<collection::Collections>,
     ordering: FoldersOrdering,
+    group: Option<String>,
 ) -> ResponseFuture {
     Box::pin(
-        blocking(move || list_dir(&base_path, &folder_path, ordering))
+        blocking(move || collections.list_dir(collection, &folder_path, ordering, group))
             .map_ok(|res| match res {
                 Ok(folder) => json_response(&folder),
                 Err(_) => resp::not_found(),
@@ -416,7 +429,15 @@ pub fn download_folder(
 
             download_name.push_str(format.extension());
 
-            match blocking(move || list_dir_files_only(&base_path, &folder_path)).await {
+            match blocking(move || {
+                collection::list_dir_files_only(
+                    &base_path,
+                    &folder_path,
+                    get_config().allow_symlinks,
+                )
+            })
+            .await
+            {
                 Ok(Ok(folder)) => {
                     let total_len: u64 = match format {
                         DownloadFormat::Tar => {
@@ -453,62 +474,7 @@ pub fn download_folder(
             }
         }
     };
-    // let f = tokio::fs::metadata(full_path.clone())
-    //     .map_err(|e| {
-    //         error!("Cannot get meta for download path");
-    //         Error::new(e).context("metadata for folder download")
-    //     })
-    //     .and_then(move |meta| {
-    //         if meta.is_file() {
-    //             serve_file_from_fs(&full_path, None, None)
-    //         } else {
-    //             let mut download_name = folder_path
-    //                 .file_name()
-    //                 .and_then(OsStr::to_str)
-    //                 .map(std::borrow::ToOwned::to_owned)
-    //                 .unwrap_or_else(|| "audio".into());
-    //             download_name.push_str(format.extension());
-    //             let fut = blocking(move || list_dir_files_only(&base_path, &folder_path))
-    //                 .and_then(move |res| match res {
-    //                     Ok(folder) => {
-    //                         let total_len: u64 = match format {
-    //                             DownloadFormat::Tar => {
-    //                                 let lens_iter = folder.iter().map(|i| i.1);
-    //                                 async_tar::calc_size(lens_iter)
-    //                             }
-    //                             DownloadFormat::Zip => {
-    //                                 let iter = folder.iter().map(|&(ref path, len)| (path, len));
-    //                                 async_zip::calc_size(iter).unwrap()
-    //                             }
-    //                         };
 
-    //                         debug!("Total len of folder is {}", total_len);
-    //                         let files = folder.into_iter().map(|i| i.0);
-    //                         let tar_stream = async_tar::TarStream::tar_iter(files);
-    //                         let disposition = format!("attachment; filename=\"{}\"", download_name);
-    //                         future::ok(HyperResponse::builder()
-    //                             .typed_header(ContentType::from(
-    //                                 format.mime(),
-    //                             ))
-    //                             .typed_header(ContentLength(total_len))
-    //                             .header(CONTENT_DISPOSITION, disposition.as_bytes())
-    //                             .body(Body::wrap_stream(tar_stream))
-    //                             .unwrap()
-    //                         )
-    //                     }
-    //                     Err(e) => {
-    //                         error!("Cannot list download dir: {}", e);
-    //                         future::ok(resp::not_found())
-    //                     }
-    //                 })
-    //                 .map_err(|e| {
-    //                     error!("Error listing files for archive {}", e);
-    //                     Error::new(e).context("listing files for archive")
-    //                 });
-
-    //             Box::pin(fut)
-    //         }
-    //     });
     Box::pin(f)
 }
 
@@ -522,10 +488,11 @@ fn json_response<T: serde::Serialize>(data: &T) -> Response {
         .unwrap()
 }
 
-const UKNOWN_NAME: &str = "unknown";
+const UNKNOWN_NAME: &str = "unknown";
 
 pub fn collections_list() -> ResponseFuture {
-    let collections = Collections {
+    let collections = CollectionsInfo {
+        version: env!("CARGO_PKG_VERSION"),
         folder_download: !get_config().disable_folder_download,
         shared_positions: if cfg!(feature = "shared-positions") {
             true
@@ -536,10 +503,95 @@ pub fn collections_list() -> ResponseFuture {
         names: get_config()
             .base_dirs
             .iter()
-            .map(|p| p.file_name().and_then(OsStr::to_str).unwrap_or(UKNOWN_NAME))
+            .map(|p| {
+                p.file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or(UNKNOWN_NAME)
+            })
             .collect(),
     };
     Box::pin(future::ok(json_response(&collections)))
+}
+
+#[cfg(feature = "shared-positions")]
+pub fn insert_position(
+    collections: Arc<collection::Collections>,
+    group: String,
+    bytes: bytes::Bytes,
+) -> ResponseFuture {
+    match serde_json::from_slice::<collection::Position>(&bytes) {
+        Ok(pos) => {
+            let path = if pos.folder.len() > 0 {
+                pos.folder + "/" + &pos.file
+            } else {
+                pos.file
+            };
+            Box::pin(
+                collections
+                    .clone()
+                    .insert_position_if_newer_async(
+                        pos.collection,
+                        group,
+                        path,
+                        pos.position,
+                        pos.folder_finished,
+                        pos.timestamp,
+                    )
+                    .then(|res| match res {
+                        Ok(_) => resp::fut(resp::created),
+                        Err(e) => match e {
+                            collection::error::Error::IgnoredPosition => resp::fut(resp::ignored),
+                            _ => Box::pin(future::err(Error::new(e))),
+                        },
+                    }),
+            )
+        }
+        Err(e) => {
+            error!("Error in position JSON: {}", e);
+            resp::fut(resp::bad_request)
+        }
+    }
+}
+
+#[cfg(feature = "shared-positions")]
+pub fn last_position(collections: Arc<collection::Collections>, group: String) -> ResponseFuture {
+    Box::pin(
+        collections
+            .get_last_position_async(group)
+            .map(|pos| Ok(json_response(&pos))),
+    )
+}
+
+#[cfg(feature = "shared-positions")]
+pub fn folder_position(
+    collections: Arc<collection::Collections>,
+    group: String,
+    collection: usize,
+    path: String,
+    recursive: bool,
+) -> ResponseFuture {
+    if recursive {
+        Box::pin(
+            collections
+                .get_positions_recursive_async(collection, group, path)
+                .map(|pos| Ok(json_response(&pos))),
+        )
+    } else {
+        Box::pin(
+            collections
+                .get_position_async(collection, group, path)
+                .map(|pos| Ok(json_response(&pos))),
+        )
+    }
+}
+
+#[cfg(feature = "shared-positions")]
+pub fn all_positions(collections: Arc<collection::Collections>, group: String) -> ResponseFuture {
+    Box::pin(
+        collections
+            .get_all_positions_for_group_async(group)
+            .map(|pos| Ok(json_response(&pos))),
+    )
 }
 
 pub fn transcodings_list() -> ResponseFuture {

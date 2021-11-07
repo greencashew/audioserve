@@ -1,3 +1,7 @@
+use std::process::exit;
+
+use collection::tags::{ALLOWED_TAGS, BASIC_TAGS};
+
 use super::validators::*;
 use super::*;
 use clap::{crate_authors, crate_name, crate_version, App, Arg};
@@ -58,10 +62,31 @@ fn create_parser<'a>() -> Parser<'a> {
             .max_values(100)
             .takes_value(true)
             .env("AUDIOSERVE_BASE_DIRS")
-            .value_delimiter(":")
-            .validator_os(is_existing_dir)
-            .help("Root directories for audio books, also referred as collections")
+            .value_delimiter(";")
+            .help("Root directories for audio books, also referred as collections, you can also add :<options> after directory path to change collection behaviour, use --help-dir-options for more details")
 
+            )
+        .arg(Arg::with_name("help-dir-options")
+            .long("help-dir-options")
+            .help("Prints help for collections directories options")
+            )
+        .arg(Arg::with_name("help-tags")
+            .long("help-tags")
+            .help("Prints help for tags options")
+        )
+        .arg(Arg::with_name("tags")
+            .long("tags")
+            .help("Collects prefered tags from audiofiles, use argument --help-tags for more details")
+            .conflicts_with("tags-custom")
+            )
+        .arg(Arg::with_name("tags-custom")
+            .long("tags-custom")
+            .help("Collects custom tags from audiofiles, list tags searated by comma, use argument --help-tags for more details")
+            .conflicts_with("tags")
+            .takes_value(true)
+            .multiple(true)
+            .use_delimiter(true)
+            .env("AUDIOSERVE_TAGS_CUSTOM")
             )
         .arg(Arg::with_name("no-authentication")
             .long("no-authentication")
@@ -158,11 +183,15 @@ fn create_parser<'a>() -> Parser<'a> {
             .help("Ignore chapters metadata, so files with chapters will not be presented as folders")
             )
         .arg(Arg::with_name("url-path-prefix")
-        .long("url-path-prefix")
-        .takes_value(true)
-        .validator(is_valid_url_path_prefix)
-        .env("AUDIOSERVE_URL_PATH_PREFIX")
-        .help("Base URL is a fixed path that is before audioserve path part, must start with / and not end with /  [default: none]")
+            .long("url-path-prefix")
+            .takes_value(true)
+            .validator(is_valid_url_path_prefix)
+            .env("AUDIOSERVE_URL_PATH_PREFIX")
+            .help("Base URL is a fixed path that is before audioserve path part, must start with / and not end with /  [default: none]")
+            )
+        .arg(Arg::with_name("force-cache-update")
+            .long("force-cache-update")
+            .help("Forces full reload of metadata cache on start")
             );
 
     if cfg!(feature = "behind-proxy") {
@@ -200,12 +229,12 @@ fn create_parser<'a>() -> Parser<'a> {
 
     if cfg!(feature = "shared-positions") {
         parser = parser.arg(
-        Arg::with_name("positions-file")
-            .long("positions-file")
+            Arg::with_name("positions-backup-file")
+            .long("positions-backup-file")
             .takes_value(true)
             .validator_os(parent_dir_exists)
-            .env("AUDIOSERVE_POSITIONS_FILE")
-            .help("File to save last listened positions []"),
+            .env("AUDIOSERVE_POSITIONS_BACKUP_FILE")
+            .help("File to back up last listened positions (can be used to restore positions as well, so has two slightly different uses) [default is None]"),
         )
         .arg(
             Arg::with_name("positions-ws-timeout")
@@ -213,6 +242,23 @@ fn create_parser<'a>() -> Parser<'a> {
             .validator(is_number)
             .env("AUDIOSERVE_POSITIONS_WS_TIMEOUT")
             .help("Timeout in seconds for idle websocket connection use for playback position sharing [default 600s]")
+        )
+        .arg(
+            Arg::with_name("positions-restore")
+            .long("positions-restore")
+            .takes_value(true)
+            .possible_values(&["legacy", "v1"])
+            .env("AUDIOSERVE_POSITIONS_RESTORE")
+            .requires("positions-backup-file")
+            .help("Restores positions from backup JSON file, value is version of file legacy is before audioserve v0.16,  v1 is current")
+        )
+        .arg(
+            Arg::with_name("positions-backup-schedule")
+            .long("positions-backup-schedule")
+            .takes_value(true)
+            .env("AUDIOSERVE_POSITIONS_BACKUP_SCHEDULE")
+            .requires("positions-backup-file")
+            .help("Sets regular schedule for backing up playback position - should be cron expression m h dom mon dow- minute (m), hour (h), day of month (dom), month (mon) day of week (dow)")
         );
     }
 
@@ -224,13 +270,9 @@ fn create_parser<'a>() -> Parser<'a> {
         );
     }
 
-    if cfg!(feature = "search-cache") {
-        parser=parser.arg(
-            Arg::with_name("search-cache")
-            .long("search-cache")
-            .help("Caches collections directory structure for quick search, monitors directories for changes")
-        );
-    }
+    parser = parser.arg(Arg::with_name("search-cache").long("search-cache").help(
+        "Deprecated: does nothing. For caching config use :<options> on individual collections dirs params",
+    ));
 
     if cfg!(feature = "transcoding-cache") {
         parser=parser.arg(
@@ -296,6 +338,16 @@ where
     let p = create_parser();
     let args = p.get_matches_from(args);
 
+    if args.is_present("help-dir-options") {
+        print_dir_options_help();
+        exit(0);
+    }
+
+    if args.is_present("help-tags") {
+        print_tags_help();
+        exit(0);
+    }
+
     if let Some(dir) = args.value_of_os("data-dir") {
         unsafe {
             BASE_DATA_DIR.take();
@@ -353,7 +405,7 @@ where
         }
     }
 
-    if let Some(base_dirs) = args.values_of_os("base-dir") {
+    if let Some(base_dirs) = args.values_of("base-dir") {
         for dir in base_dirs {
             config.add_base_dir(dir)?;
         }
@@ -417,11 +469,27 @@ where
         config.cors = true;
     }
 
+    if is_present_or_env("force-cache-update", "AUDIOSERVE_FORCE_CACHE_UPDATE") {
+        config.force_cache_update_on_init = true
+    }
+
+    if let Some(tags) = args.values_of("tags-custom") {
+        for t in tags {
+            if !ALLOWED_TAGS.contains(&t) {
+                arg_error!("tags-custom", "Unknown tag")?
+            }
+            config.tags.insert(t.to_string());
+        }
+    } else if is_present_or_env("tags", "AUDIOSERVE_TAGS") {
+        config.tags.extend(BASIC_TAGS.iter().map(|i| i.to_string()));
+    }
+
     if cfg!(feature = "symlinks")
         && is_present_or_env("allow-symlinks", "AUDIOSERVE_ALLOW_SYMLINKS")
     {
         config.allow_symlinks = true
     }
+
     #[cfg(feature = "tls")]
     {
         if let Some(key) = args.value_of("ssl-key") {
@@ -433,12 +501,6 @@ where
             });
         }
     }
-
-    if cfg!(feature = "search-cache")
-        && is_present_or_env("search-cache", "AUDIOSERVE_SEARCH_CACHE")
-    {
-        config.search_cache = true
-    };
 
     #[cfg(feature = "transcoding-cache")]
     {
@@ -493,12 +555,24 @@ where
         config.ignore_chapters_meta = true;
     }
 
-    if let Some(positions_file) = args.value_of_os("positions-file") {
-        config.positions_file = positions_file.into();
-    }
+    #[cfg(feature = "shared-positions")]
+    {
+        if let Some(ps) = args.value_of("positions-restore") {
+            config.positions.restore = ps.parse().expect("Value was checked by clap");
+            no_authentication_confirmed = true;
+        }
 
-    if let Some(positions_ws_timeout) = args.value_of("positions-ws-timeout") {
-        config.positions_ws_timeout = Duration::from_secs(positions_ws_timeout.parse().unwrap())
+        if let Some(positions_backup_file) = args.value_of_os("positions-backup-file") {
+            config.positions.backup_file = Some(positions_backup_file.into());
+        }
+
+        if let Some(positions_ws_timeout) = args.value_of("positions-ws-timeout") {
+            config.positions.ws_timeout = Duration::from_secs(positions_ws_timeout.parse().unwrap())
+        }
+
+        if let Some(positions_backup_schedule) = args.value_of("positions-backup-schedule") {
+            config.positions.backup_schedule = Some(positions_backup_schedule.into());
+        }
     }
 
     if !no_authentication_confirmed && config.shared_secret.is_none() {
@@ -518,10 +592,50 @@ where
     config.check()?;
     if args.is_present("print-config") {
         println!("{}", serde_yaml::to_string(&config).unwrap());
-        std::process::exit(0);
+        exit(0);
     }
 
     Ok(config)
+}
+
+fn print_dir_options_help() {
+    print!(
+        "
+Options can be used to change behaviour of collection directories.
+Option is added after collection path argument separated with : and individual options
+are separated by ;. Example /my/audio:no-cache .
+
+Available options:
+nc or no-cache      directory will not use cache (browsing and search will be slower for large 
+                    collection, playback position sharing and metadata tags will not work)
+
+"
+    )
+}
+
+pub fn print_tags_help() {
+    print!("
+You can define metadata tags, that will be collected from audiofiles and presented via API with folder information.
+Tags that will be same for all audiofiles in folder will be available on folder level, tags that differs per file
+will be present on file level. 
+You need to opt in for tags to be included, either use --tags argument to include preferred preselected tags or --tags-custom,
+where you can select tags you want separated by comma.
+BE AWARE: if you use or change tags arguments all collection cache has to be rescaned! 
+
+Preferred tags are: 
+");
+    print_tags(BASIC_TAGS);
+
+    println!("\nAvailable tags are:");
+
+    print_tags(ALLOWED_TAGS);
+}
+
+fn print_tags(list: &[&str]) {
+    list.chunks(8).for_each(|c| {
+        let row = c.iter().map(|r| *r).collect::<Vec<_>>().join(", ");
+        println!("{},", row)
+    })
 }
 
 #[cfg(test)]

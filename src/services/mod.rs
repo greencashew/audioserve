@@ -5,19 +5,25 @@ use self::subs::{
     ResponseFuture,
 };
 use self::transcode::QualityLevel;
-use self::types::FoldersOrdering;
 use crate::config::get_config;
+use crate::util::ResponseBuilderExt;
 use crate::{error, util::header2header};
 use bytes::{Bytes, BytesMut};
+use collection::{Collections, FoldersOrdering};
 use futures::prelude::*;
 use futures::{future, TryFutureExt};
 use headers::{
-    AccessControlAllowCredentials, AccessControlAllowOrigin, HeaderMapExt, Origin, Range,
+    AccessControlAllowCredentials, AccessControlAllowHeaders, AccessControlAllowMethods,
+    AccessControlAllowOrigin, AccessControlMaxAge, AccessControlRequestHeaders, HeaderMapExt,
+    Origin, Range,
 };
+use hyper::StatusCode;
 use hyper::{body::HttpBody, service::Service, Body, Method, Request, Response};
 use leaky_cauldron::Leaky;
 use percent_encoding::percent_decode;
 use regex::Regex;
+use std::iter::FromIterator;
+use std::time::Duration;
 use std::{
     borrow::Cow,
     collections::HashMap,
@@ -32,8 +38,6 @@ use std::{
 };
 use url::form_urlencoded;
 
-pub mod audio_folder;
-pub mod audio_meta;
 pub mod auth;
 #[cfg(feature = "shared-positions")]
 pub mod position;
@@ -200,6 +204,34 @@ impl RequestWrapper {
             .query()
             .map(|query| form_urlencoded::parse(query.as_bytes()).collect::<HashMap<_, _>>())
     }
+
+    pub fn is_https(&self) -> bool {
+        if self.is_ssl {
+            return true;
+        }
+        #[cfg(feature = "behind-proxy")]
+        if self.is_behind_proxy {
+            //try scommon  proxy headers
+            let forwarded_https = self
+                .request
+                .headers()
+                .typed_get::<proxy_headers::Forwarded>()
+                .and_then(|fwd| fwd.client_protocol().map(|p| p.as_ref() == "https"))
+                .unwrap_or(false);
+
+            if forwarded_https {
+                return true;
+            }
+
+            return self
+                .request
+                .headers()
+                .get("X-Forwarded-Proto")
+                .map(|v| v.as_bytes() == b"https")
+                .unwrap_or(false);
+        }
+        false
+    }
 }
 #[derive(Clone)]
 pub struct TranscodingDetails {
@@ -212,6 +244,7 @@ pub struct ServiceFactory<T> {
     rate_limitter: Option<Arc<Leaky>>,
     search: Search<String>,
     transcoding: TranscodingDetails,
+    collections: Arc<Collections>,
 }
 
 impl<T> ServiceFactory<T> {
@@ -219,6 +252,7 @@ impl<T> ServiceFactory<T> {
         auth: Option<A>,
         search: Search<String>,
         transcoding: TranscodingDetails,
+        collections: Arc<Collections>,
         rate_limit: Option<f32>,
     ) -> Self
     where
@@ -230,6 +264,7 @@ impl<T> ServiceFactory<T> {
             rate_limitter: rate_limit.map(|l| Arc::new(Leaky::new(l))),
             search,
             transcoding,
+            collections,
         }
     }
 
@@ -243,6 +278,7 @@ impl<T> ServiceFactory<T> {
             rate_limitter: self.rate_limitter.clone(),
             search: self.search.clone(),
             transcoding: self.transcoding.clone(),
+            collections: self.collections.clone(),
             remote_addr,
             is_ssl,
         })
@@ -255,6 +291,7 @@ pub struct FileSendService<T> {
     pub rate_limitter: Option<Arc<Leaky>>,
     pub search: Search<String>,
     pub transcoding: TranscodingDetails,
+    pub collections: Arc<Collections>,
     pub remote_addr: Option<SocketAddr>,
     pub is_ssl: bool,
 }
@@ -285,6 +322,29 @@ fn add_cors_headers(
     }
 }
 
+fn preflight_cors_response(req: &Request<Body>) -> Response<Body> {
+    let origin = req.headers().typed_get::<Origin>();
+    const ALLOWED_METHODS: &[Method] = &[Method::GET, Method::POST, Method::OPTIONS];
+
+    let mut resp_builder = Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        // Allow all requested headers
+        .typed_header(AccessControlAllowMethods::from_iter(
+            ALLOWED_METHODS.iter().cloned(),
+        ))
+        .typed_header(AccessControlMaxAge::from(Duration::from_secs(24 * 3600)));
+
+    if let Some(requested_headers) = req.headers().typed_get::<AccessControlRequestHeaders>() {
+        resp_builder = resp_builder.typed_header(AccessControlAllowHeaders::from_iter(
+            requested_headers.iter(),
+        ));
+    }
+
+    let resp = resp_builder.body(Body::empty()).unwrap();
+
+    add_cors_headers(resp, origin, true)
+}
+
 #[allow(clippy::type_complexity)]
 impl<C: 'static> Service<Request<Body>> for FileSendService<C> {
     type Response = Response<Body>;
@@ -296,12 +356,31 @@ impl<C: 'static> Service<Request<Body>> for FileSendService<C> {
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        //Limit rate of requests in configured
+        Box::pin(self.process_request(req).or_else(|e| {
+            error!("Request processing error: {}", e);
+            future::ok(resp::internal_error())
+        }))
+    }
+}
+
+impl<C: 'static> FileSendService<C> {
+    fn process_request(&mut self, req: Request<Body>) -> ResponseFuture {
+        //Limit rate of requests if configured
         if let Some(limiter) = self.rate_limitter.as_ref() {
             if let Err(_) = limiter.start_one() {
                 debug!("Rejecting request due to rate limit");
                 return resp::fut(resp::too_many_requests);
             }
+        }
+
+        // handle OPTIONS method for CORS preflightAtomicUsize
+        if req.method() == Method::OPTIONS && get_config().cors {
+            debug!(
+                "Got OPTIONS request in CORS mode : {} {:?}",
+                req.uri(),
+                req.headers()
+            );
+            return Box::pin(future::ok(preflight_cors_response(&req)));
         }
 
         let req = match RequestWrapper::new(
@@ -317,19 +396,21 @@ impl<C: 'static> Service<Request<Body>> for FileSendService<C> {
             }
         };
         //static files
-        if req.path() == "/" {
-            return send_file_simple(
-                &get_config().client_dir,
-                "index.html",
-                Some(APP_STATIC_FILES_CACHE_AGE),
-            );
-        };
-        if req.path() == "/bundle.js" {
-            return send_file_simple(
-                &get_config().client_dir,
-                "bundle.js",
-                Some(APP_STATIC_FILES_CACHE_AGE),
-            );
+        if req.method() == Method::GET {
+            if req.path() == "/" {
+                return send_file_simple(
+                    &get_config().client_dir,
+                    "index.html",
+                    Some(APP_STATIC_FILES_CACHE_AGE),
+                );
+            };
+            if req.path() == "/bundle.js" {
+                return send_file_simple(
+                    &get_config().client_dir,
+                    "bundle.js",
+                    Some(APP_STATIC_FILES_CACHE_AGE),
+                );
+            }
         }
         // from here everything must be authenticated
         let searcher = self.search.clone();
@@ -339,42 +420,71 @@ impl<C: 'static> Service<Request<Body>> for FileSendService<C> {
 
         let resp = match self.authenticator {
             Some(ref auth) => {
+                let collections = self.collections.clone();
                 Box::pin(auth.authenticate(req).and_then(move |result| match result {
                     AuthResult::Authenticated { request, .. } => {
-                        FileSendService::<C>::process_checked(request, searcher, transcoding)
+                        FileSendService::<C>::process_checked(
+                            request,
+                            searcher,
+                            transcoding,
+                            collections,
+                        )
                     }
                     AuthResult::LoggedIn(resp) | AuthResult::Rejected(resp) => {
                         Box::pin(future::ok(resp))
                     }
                 }))
             }
-            None => FileSendService::<C>::process_checked(req, searcher, transcoding),
+            None => FileSendService::<C>::process_checked(
+                req,
+                searcher,
+                transcoding,
+                self.collections.clone(),
+            ),
         };
         Box::pin(resp.map_ok(move |r| add_cors_headers(r, origin, cors)))
     }
-}
 
-impl<C> FileSendService<C> {
     fn process_checked(
-        req: RequestWrapper,
+        #[allow(unused_mut)] mut req: RequestWrapper,
         searcher: Search<String>,
         transcoding: TranscodingDetails,
+        collections: Arc<Collections>,
     ) -> ResponseFuture {
         let params = req.params();
-
+        let path = req.path();
         match *req.method() {
             Method::GET => {
-                let path = req.path();
-
                 if path.starts_with("/collections") {
                     collections_list()
                 } else if path.starts_with("/transcodings") {
                     transcodings_list()
+                } else if cfg!(feature = "shared-positions") && path.starts_with("/positions") {
+                    // positions API
+                    #[cfg(feature = "shared-positions")]
+                    match extract_group(path) {
+                        PositionGroup::Group(group) => subs::all_positions(collections, group),
+                        PositionGroup::Last(group) => subs::last_position(collections, group),
+                        PositionGroup::Path {
+                            collection,
+                            group,
+                            path,
+                        } => {
+                            let recursive = req
+                                .params()
+                                .map(|p| p.get("rec").is_some())
+                                .unwrap_or(false);
+                            subs::folder_position(collections, group, collection, path, recursive)
+                        }
+                        PositionGroup::Malformed => resp::fut(resp::bad_request),
+                    }
+                    #[cfg(not(feature = "shared-positions"))]
+                    unimplemented!();
                 } else if cfg!(feature = "shared-positions") && path.starts_with("/position") {
                     #[cfg(not(feature = "shared-positions"))]
                     unimplemented!();
                     #[cfg(feature = "shared-positions")]
-                    self::position::position_service(req)
+                    self::position::position_service(req, collections)
                 } else {
                     let (path, colllection_index) = match extract_collection_number(path) {
                         Ok(r) => r,
@@ -398,7 +508,16 @@ impl<C> FileSendService<C> {
                             params,
                         )
                     } else if path.starts_with("/folder/") {
-                        get_folder(base_dir, get_subpath(&path, "/folder/"), ord)
+                        let group = params
+                            .as_ref()
+                            .and_then(|m| m.get("group").map(|i| i.to_string()));
+                        get_folder(
+                            colllection_index,
+                            get_subpath(&path, "/folder/"),
+                            collections,
+                            ord,
+                            group,
+                        )
                     } else if !get_config().disable_folder_download && path.starts_with("/download")
                     {
                         #[cfg(feature = "folder-download")]
@@ -445,6 +564,47 @@ impl<C> FileSendService<C> {
                         resp::fut(resp::not_found)
                     }
                 }
+            }
+
+            Method::POST => {
+                #[cfg(feature = "shared-positions")]
+                if path.starts_with("/positions") {
+                    match extract_group(path) {
+                        PositionGroup::Group(group) => {
+                            if req
+                                .headers()
+                                .get("Content-Type")
+                                .and_then(|v| {
+                                    v.to_str()
+                                        .ok()
+                                        .map(|s| s.to_lowercase().eq("application/json"))
+                                })
+                                .unwrap_or(false)
+                            {
+                                Box::pin(async move {
+                                    match req.body_bytes().await {
+                                        Ok(bytes) => {
+                                            subs::insert_position(collections, group, bytes).await
+                                        }
+                                        Err(e) => {
+                                            error!("Error reading POST body: {}", e);
+                                            Ok(resp::bad_request())
+                                        }
+                                    }
+                                })
+                            } else {
+                                error!("Not JSON content type");
+                                resp::fut(resp::bad_request)
+                            }
+                        }
+                        _ => resp::fut(resp::bad_request),
+                    }
+                } else {
+                    resp::fut(resp::not_found)
+                }
+
+                #[cfg(not(feature = "shared-positions"))]
+                resp::fut(resp::method_not_supported)
             }
 
             _ => resp::fut(resp::method_not_supported),
@@ -517,5 +677,83 @@ fn extract_collection_number(path: &str) -> Result<(&str, usize), ()> {
         Ok((new_path, cnum))
     } else {
         Ok((path, 0))
+    }
+}
+
+#[cfg(feature = "shared-positions")]
+#[derive(Debug)]
+enum PositionGroup {
+    Group(String),
+    Last(String),
+    Path {
+        group: String,
+        collection: usize,
+        path: String,
+    },
+    Malformed,
+}
+
+#[cfg(feature = "shared-positions")]
+fn extract_group(path: &str) -> PositionGroup {
+    let mut segments = path.splitn(5, '/');
+    segments.next(); // read out first empty segment
+    segments.next(); // readout positions segment
+    if let Some(group) = segments.next().map(|g| g.to_owned()) {
+        if let Some(last) = segments.next() {
+            if last == "last" {
+                //only last position
+                return PositionGroup::Last(group);
+            } else if let Ok(collection) = last.parse::<usize>() {
+                if let Some(path) = segments.next() {
+                    return PositionGroup::Path {
+                        group,
+                        collection,
+                        path: path.into(),
+                    };
+                }
+            }
+        } else {
+            return PositionGroup::Group(group);
+        }
+    }
+    PositionGroup::Malformed
+}
+
+#[cfg(test)]
+#[cfg(feature = "shared-positions")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_group() {
+        if let PositionGroup::Group(x) = extract_group("/positions/usak") {
+            assert_eq!(x, "usak");
+        } else {
+            panic!("group does not match")
+        }
+
+        if let PositionGroup::Last(x) = extract_group("/positions/usak/last") {
+            assert_eq!(x, "usak");
+        } else {
+            panic!("group does not match")
+        }
+
+        if let PositionGroup::Path {
+            path,
+            collection,
+            group,
+        } = extract_group("/positions/usak/0/hrabe/drakula")
+        {
+            assert_eq!(group, "usak");
+            assert_eq!(collection, 0);
+            assert_eq!(path, "hrabe/drakula");
+        } else {
+            panic!("group does not match")
+        }
+
+        if let PositionGroup::Malformed = extract_group("/positions/chcip/pes") {
+        } else {
+            panic!("should be invalid")
+        }
     }
 }

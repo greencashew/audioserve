@@ -224,6 +224,54 @@ span.subtitle {
     cursor: pointer;
 }
 
+.folder-finished {
+    font-style: italic;
+    }
+
+.folder-finished::after {
+    content: " ✓";
+    font-size: 150%;
+    
+}
+
+#files-duration {
+    font-size: 50%;
+    color: gray;
+}
+
+#info-tags {
+    width: 330px;
+}
+
+#info-tags table {
+    border: 1px lightgray solid;
+}
+
+.file-tags-title {
+    font-size: 80%;
+    color: gray;
+    padding-left: 1em;
+}
+
+.active .file-tags-title{
+    color: lightgray;
+}
+
+ #main-content {
+    display: flex;
+    flex-wrap: nowrap;
+    flex-direction: row;
+  }
+
+  #info-sidebar {
+    max-width: 360px;
+  }
+
+  #collection-browser {
+    width: 100%;
+    margin-right: 3em;
+  }
+
 @media (max-width: 1024px) {
     h1.top-header {
         font-size: 1.6rem;
@@ -241,6 +289,10 @@ span.subtitle {
         float: none;
         text-align: left;
         width: 100%;
+    }
+
+    #main-content {
+        flex-direction: column;
     }
 }
 

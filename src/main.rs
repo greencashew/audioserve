@@ -5,6 +5,9 @@ extern crate serde_derive;
 #[macro_use]
 extern crate lazy_static;
 
+use collection::audio_folder::FoldersOptions;
+use collection::common::CollectionOptions;
+use collection::Collections;
 use config::{get_config, init_config};
 use error::{bail, Context, Error};
 use futures::prelude::*;
@@ -13,13 +16,16 @@ use ring::rand::{SecureRandom, SystemRandom};
 use services::{
     auth::SharedSecretAuthenticator, search::Search, ServiceFactory, TranscodingDetails,
 };
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 mod config;
 mod error;
@@ -76,7 +82,59 @@ macro_rules! get_url_path {
     };
 }
 
-fn start_server(server_secret: Vec<u8>) -> tokio::runtime::Runtime {
+fn create_folder_options() -> (FoldersOptions, HashMap<PathBuf, CollectionOptions>) {
+    let fo = FoldersOptions {
+        allow_symlinks: get_config().allow_symlinks,
+        chapters_duration: get_config().chapters.duration,
+        chapters_from_duration: get_config().chapters.from_duration,
+        ignore_chapters_meta: get_config().ignore_chapters_meta,
+        no_dir_collaps: get_config().no_dir_collaps,
+        tags: Arc::new(get_config().get_tags()),
+        force_cache_update_on_init: get_config().force_cache_update_on_init,
+    };
+    let co: HashMap<_, _> = get_config()
+        .base_dirs_options
+        .iter()
+        .map(|(p, o)| {
+            (
+                p.clone(),
+                CollectionOptions {
+                    no_cache: o.no_cache,
+                },
+            )
+        })
+        .collect();
+
+    (fo, co)
+}
+
+fn create_collections() -> Arc<Collections> {
+    let (fo, co) = create_folder_options();
+    Arc::new(
+        Collections::new_with_detail::<Vec<PathBuf>, _, _>(
+            get_config().base_dirs.clone(),
+            co,
+            get_config().collections_cache_dir.as_path(),
+            fo,
+        )
+        .expect("Unable to create collections cache"),
+    )
+}
+
+#[cfg(feature = "shared-positions")]
+fn restore_positions<P: AsRef<Path>>(backup_file: collection::BackupFile<P>) -> anyhow::Result<()> {
+    let (fo, co) = create_folder_options();
+    Collections::restore_positions(
+        get_config().base_dirs.clone(),
+        co,
+        get_config().collections_cache_dir.as_path(),
+        fo,
+        backup_file,
+    )
+    .map_err(Error::new)
+}
+
+fn start_server(server_secret: Vec<u8>, collections: Arc<Collections>) -> tokio::runtime::Runtime {
     let cfg = get_config();
 
     let addr = cfg.listen;
@@ -88,8 +146,13 @@ fn start_server(server_secret: Vec<u8>) -> tokio::runtime::Runtime {
             transcodings: Arc::new(AtomicUsize::new(0)),
             max_transcodings: cfg.transcoding.max_parallel_processes,
         };
-        let svc_factory =
-            ServiceFactory::new(authenticator, Search::new(), transcoding, cfg.limit_rate);
+        let svc_factory = ServiceFactory::new(
+            authenticator,
+            Search::new(Some(collections.clone())),
+            transcoding,
+            collections,
+            cfg.limit_rate,
+        );
 
         let server: Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> =
             match get_config().ssl.as_ref() {
@@ -171,7 +234,57 @@ async fn terminate_server() {
     )
 }
 
-fn main() {
+#[cfg(unix)]
+async fn watch_for_cache_update_signal(cols: Arc<Collections>) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigusr1 = signal(SignalKind::user_defined1()).expect("Cannot create SIGUSR1 handler");
+    while let Some(()) = sigusr1.recv().await {
+        info!("Received signal SIGUSR1 for full rescan of caches");
+        cols.clone().force_rescan()
+    }
+}
+
+#[cfg(unix)]
+#[cfg(feature = "shared-positions")]
+async fn watch_for_positions_backup_signal(cols: Arc<Collections>) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut cron = get_config()
+        .positions
+        .backup_schedule
+        .as_ref()
+        .map(|s| crate::util::parse_cron(s).expect("invalid cron expression"));
+    let mut next_dur = move || {
+        cron.as_mut()
+            .and_then(|cron| cron.upcoming(chrono::Local).next())
+            .map(|d| {
+                (d - chrono::Local::now())
+                    .to_std()
+                    .unwrap_or_else(|_| Duration::from_millis(100))
+            })
+            .unwrap_or_else(|| Duration::from_secs(u64::MAX))
+    };
+    let mut sigusr2 = signal(SignalKind::user_defined2()).expect("Cannot create SIGUSR2 handler");
+
+    loop {
+        let res = tokio::time::timeout(next_dur(), sigusr2.recv()).await;
+        match res {
+            Ok(None) => break,
+            Ok(Some(())) => info!("Received signal SIGUSR2 for positions backup"),
+            Err(_) => debug!("scheduled positions backup"),
+        }
+        if let Some(backup_file) = get_config().positions.backup_file.as_ref() {
+            cols.clone()
+                .backup_positions_async(backup_file)
+                .await
+                .map_err(|e| error!("Backup of positions failed: {}", e))
+                .ok();
+        } else {
+            error!("Positions backup file not configured")
+        }
+    }
+}
+
+fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         if nix::unistd::getuid().is_root() {
@@ -179,13 +292,40 @@ fn main() {
         }
     }
     if let Err(e) = init_config() {
-        eprintln!("Config/Arguments error: {}", e);
-        process::exit(1)
+        return Err(Error::msg(format!("Config/Arguments error: {}", e)));
     };
     env_logger::init();
     debug!("Started with following config {:?}", get_config());
 
-    services::audio_meta::init_media_lib();
+    collection::init_media_lib();
+
+    #[cfg(feature = "shared-positions")]
+    if !matches!(
+        get_config().positions.restore,
+        config::PositionsBackupFormat::None
+    ) {
+        let backup_file = get_config()
+            .positions
+            .backup_file
+            .clone()
+            .expect("Missing backup file argument");
+
+        use collection::BackupFile;
+        use config::PositionsBackupFormat::*;
+        let backup_file = match get_config().positions.restore {
+            None => unreachable!(),
+            Legacy => BackupFile::Legacy(backup_file),
+            V1 => BackupFile::V1(backup_file),
+        };
+
+        restore_positions(backup_file).context("Error while restoring position")?;
+
+        let msg =
+            "Positions restoration is finished, exiting program, restart it now without --positions-restore arg";
+        info!("{}", msg);
+        println!("{}", msg);
+        return Ok(());
+    }
 
     #[cfg(feature = "transcoding-cache")]
     {
@@ -203,23 +343,46 @@ fn main() {
     }
     let server_secret = match generate_server_secret(&get_config().secret_file) {
         Ok(s) => s,
-        Err(e) => {
-            error!("Error creating/reading secret: {}", e);
-            process::exit(2)
-        }
+        Err(e) => return Err(Error::msg(format!("Error creating/reading secret: {}", e))),
     };
 
-    let runtime = start_server(server_secret);
+    let collections = create_collections();
+
+    let runtime = start_server(server_secret, collections.clone());
+
+    #[cfg(unix)]
+    {
+        runtime.spawn(watch_for_cache_update_signal(collections.clone()));
+        #[cfg(feature = "shared-positions")]
+        runtime.spawn(watch_for_positions_backup_signal(collections.clone()));
+    }
 
     runtime.block_on(terminate_server());
 
-    #[cfg(feature = "shared-positions")]
-    {
-        debug!("Saving shared positions");
-        runtime.block_on(crate::services::position::save_positions());
-    }
     //graceful shutdown of server will wait till transcoding ends, so rather shut it down hard
     runtime.shutdown_timeout(std::time::Duration::from_millis(300));
+
+    thread::spawn(|| {
+        const FINISH_LIMIT: u64 = 10;
+        thread::sleep(Duration::from_secs(FINISH_LIMIT));
+        error!(
+            "Forced exit, program is not finishing with limit of {}s",
+            FINISH_LIMIT
+        );
+        process::exit(111);
+    });
+
+    debug!("Saving collections db");
+    match Arc::try_unwrap(collections) {
+        Ok(c) => drop(c),
+        Err(c) => {
+            error!(
+                "Cannot close collections, still has {} references",
+                Arc::strong_count(&c)
+            );
+            c.flush().ok(); // flush at least
+        }
+    }
 
     #[cfg(feature = "transcoding-cache")]
     {
@@ -233,4 +396,6 @@ fn main() {
     }
 
     info!("Server finished");
+
+    Ok(())
 }
