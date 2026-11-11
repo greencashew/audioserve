@@ -25,19 +25,19 @@ pub enum AddrError<'a> {
     SocketInsteadIp,
 }
 
-impl<'a> From<AddrError<'a>> for headers::Error {
+impl From<AddrError<'_>> for headers::Error {
     fn from(_: AddrError) -> Self {
         headers::Error::invalid()
     }
 }
 
-impl<'a> From<AddrParseError> for AddrError<'a> {
+impl From<AddrParseError> for AddrError<'_> {
     fn from(_: AddrParseError) -> Self {
         AddrError::InvalidAddress
     }
 }
 
-impl<'a> From<Utf8Error> for AddrError<'a> {
+impl From<Utf8Error> for AddrError<'_> {
     fn from(e: Utf8Error) -> Self {
         AddrError::InvalidString(e)
     }
@@ -92,14 +92,14 @@ impl From<IpOrSocket> for NodeIdentifier {
 }
 
 impl IpOrSocket {
-    fn to_ip_only<'a>(self) -> Result<IpAddr, AddrError<'a>> {
+    fn to_ip_only<'a>(&self) -> Result<IpAddr, AddrError<'a>> {
         match self {
-            IpOrSocket::Ip(addr) => Ok(addr),
+            IpOrSocket::Ip(addr) => Ok(*addr),
             _ => Err(AddrError::SocketInsteadIp),
         }
     }
 }
-fn parse_ip(s: &str) -> Result<IpOrSocket, AddrError> {
+fn parse_ip(s: &str) -> Result<IpOrSocket, AddrError<'_>> {
     if s.starts_with('[') {
         if s.ends_with(']') {
             // this should be IPv6 address
@@ -111,15 +111,15 @@ fn parse_ip(s: &str) -> Result<IpOrSocket, AddrError> {
             match s.parse::<SocketAddrV6>() {
                 Ok(a) => Ok(IpOrSocket::Socket(SocketAddr::V6(a))),
                 Err(_e) => {
-                    return Err(AddrError::InvalidAddress);
+                    Err(AddrError::InvalidAddress)
                     //TBD:  It can have obfuscated port
                 }
             }
         }
     } else {
         s.parse::<IpAddr>()
-            .map(|addr| IpOrSocket::Ip(addr))
-            .or_else(|_| s.parse::<SocketAddr>().map(|a| IpOrSocket::Socket(a)))
+            .map(IpOrSocket::Ip)
+            .or_else(|_| s.parse::<SocketAddr>().map(IpOrSocket::Socket))
             .map_err(AddrError::from)
     }
 }
@@ -231,19 +231,19 @@ pub struct Forwarded {
 impl Forwarded {
     pub fn client(&self) -> Option<&IpAddr> {
         self.nodes
-            .get(0)
+            .first()
             .and_then(|n| n.fwd_for.as_ref())
             .and_then(|i| i.ip())
     }
     pub fn client_port(&self) -> Option<u16> {
         self.nodes
-            .get(0)
+            .first()
             .and_then(|n| n.fwd_for.as_ref())
             .and_then(|i| i.port())
     }
 
     pub fn client_protocol(&self) -> Option<&Protocol> {
-        self.nodes.get(0).and_then(|n| n.fwd_protocol.as_ref())
+        self.nodes.first().and_then(|n| n.fwd_protocol.as_ref())
     }
 }
 
@@ -367,9 +367,8 @@ pub struct XForwardedFor {
 
 impl XForwardedFor {
     pub fn client(&self) -> &IpAddr {
-        &self
-            .ips
-            .get(0)
+        self.ips
+            .first()
             .expect("at least one record is alway present")
     }
 
@@ -456,12 +455,12 @@ mod test {
             r#"For="[2001:db8:cafe::17]:4711", For=192.0.2.43:47011"#,
         ];
 
-        for (n, h) in headers.into_iter().enumerate() {
-            let v =
-                HeaderValue::from_str(h).expect(&format!("Cannot create header value for #{}", n));
+        for (n, h) in headers.iter().enumerate() {
+            let v = HeaderValue::from_str(h)
+                .unwrap_or_else(|_| panic!("Cannot create header value for #{}", n));
             let mut i = iter::once(&v);
             let fwd = Forwarded::decode(&mut i)
-                .expect(&format!("Failed decode header {}: {}", n, headers[n]));
+                .unwrap_or_else(|_| panic!("Failed decode header {}: {}", n, headers[n]));
             match n {
                 0 => {
                     assert_eq!(fwd.nodes.len(), 1, "first case has just one node");

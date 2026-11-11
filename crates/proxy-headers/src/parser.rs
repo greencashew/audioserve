@@ -1,13 +1,14 @@
+#![allow(clippy::type_complexity)]
 use std::{borrow::Cow, str::Utf8Error, string::FromUtf8Error};
 
 use nom::{
     branch::alt,
     bytes::complete::{escaped_transform, tag, take_while1, take_while_m_n},
-    character::{complete::space0, is_alphanumeric},
+    character::complete::space0,
     combinator::{cut, map, rest},
     multi::separated_list1,
-    sequence::{preceded, separated_pair, terminated, tuple},
-    IResult,
+    sequence::{preceded, separated_pair, terminated},
+    AsChar, IResult, Parser,
 };
 
 pub type Error<'a> = nom::error::Error<&'a [u8]>;
@@ -22,8 +23,8 @@ macro_rules! def_set {
     ($($name:ident = $chars: expr),*) => {
         $(
             pub fn $name(input: &[u8]) -> IResult<&[u8], &[u8]> {
-                let is_char = |c| is_alphanumeric(c) || $chars.contains(&c);
-                take_while1(is_char)(input)
+                let is_char = |c: u8| c.is_alphanum() || $chars.contains(&c);
+                take_while1(is_char).parse(input)
             }
 
         )*
@@ -86,7 +87,7 @@ pub fn quoted_string(input: &[u8]) -> IResult<&[u8], Vec<u8>> {
         '\\',
         take_while_m_n(1, 1, is_escapable),
     );
-    preceded(tag(QUOTE), cut(terminated(escaped, tag(QUOTE))))(input)
+    preceded(tag(QUOTE), cut(terminated(escaped, tag(QUOTE)))).parse(input)
 }
 
 fn is_quoted_text(c: u8) -> bool {
@@ -97,35 +98,35 @@ fn is_quoted_text(c: u8) -> bool {
         && c != b'"'
         && (c == b'\t'
             || c == b' '
-            || (c >= 0x23 && c <= 0x5b)
-            || (c >= 0x4d && c <= 0x7e)
+            || (0x23..=0x5b).contains(&c)
+            || (0x4d..=0x7e).contains(&c)
             || c >= 0x80)
 }
 
 fn is_escapable(c: u8) -> bool {
     // RFC 7230   quoted-pair    = "\" ( HTAB / SP / VCHAR / obs-text )
     // RFC 5234  VCHAR          =  %x21-7E
-    c == b'\t' || (c >= 0x20 && c <= 0x7e) || c >= 0x80
+    c == b'\t' || (0x20..=0x7e).contains(&c) || c >= 0x80
 }
 
-pub fn value(input: &[u8]) -> IResult<&[u8], Cow<[u8]>> {
-    alt((map(token, Cow::Borrowed), map(quoted_string, Cow::Owned)))(input)
+pub fn value(input: &[u8]) -> IResult<&[u8], Cow<'_, [u8]>> {
+    alt((map(token, Cow::Borrowed), map(quoted_string, Cow::Owned))).parse(input)
 }
 
-pub fn values_list(input: &[u8]) -> IResult<&[u8], Vec<Cow<[u8]>>> {
-    terminated(separated_list1(tuple((tag(b","), space0)), value), space0)(input)
+pub fn values_list(input: &[u8]) -> IResult<&[u8], Vec<Cow<'_, [u8]>>> {
+    terminated(separated_list1((tag(","), space0), value), space0).parse(input)
 }
 
-pub fn pair(input: &[u8]) -> IResult<&[u8], (&[u8], Cow<[u8]>)> {
-    separated_pair(token, tag(b"="), value)(input)
+pub fn pair(input: &[u8]) -> IResult<&[u8], (&[u8], Cow<'_, [u8]>)> {
+    separated_pair(token, tag("="), value).parse(input)
 }
 
-pub fn element(input: &[u8]) -> IResult<&[u8], Vec<(&[u8], Cow<[u8]>)>> {
-    separated_list1(tag(b";"), pair)(input)
+pub fn element(input: &[u8]) -> IResult<&[u8], Vec<(&[u8], Cow<'_, [u8]>)>> {
+    separated_list1(tag(";"), pair).parse(input)
 }
 
-pub fn elements(input: &[u8]) -> IResult<&[u8], Vec<Vec<(&[u8], Cow<[u8]>)>>> {
-    separated_list1(tuple((tag(b","), space0)), element)(input)
+pub fn elements(input: &[u8]) -> IResult<&[u8], Vec<Vec<(&[u8], Cow<'_, [u8]>)>>> {
+    separated_list1((tag(","), space0), element).parse(input)
 }
 
 #[cfg(test)]

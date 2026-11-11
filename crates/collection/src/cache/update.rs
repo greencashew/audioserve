@@ -1,90 +1,375 @@
 use std::{
+    cmp::Ordering,
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Receiver, RecvTimeoutError};
-use notify::DebouncedEvent;
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use indexmap::IndexMap;
+use notify::{
+    event::{ModifyKind, RemoveKind, RenameMode},
+    Event, EventKind,
+};
 
 use crate::{util::get_modified, AudioFolderShort};
 
-use super::CacheInner;
+use super::{util::parent_path, CacheInner};
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub(crate) enum UpdateAction {
-    RefreshFolder(PathBuf),
-    RefreshFolderRecursive(PathBuf),
-    RemoveFolder(PathBuf),
-    RenameFolder { from: PathBuf, to: PathBuf },
+pub(crate) struct UpdateAction {
+    pub path: PathBuf,
+    pub kind: UpdateActionKind,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+pub(crate) enum UpdateActionKind {
+    RefreshFolder,
+    RefreshFolderRecursive,
+    RemoveFolder,
+    RenameFolder { to: PathBuf },
+}
+
+impl UpdateAction {
+    pub fn new(path: impl Into<PathBuf>, kind: UpdateActionKind) -> Self {
+        UpdateAction {
+            path: path.into(),
+            kind,
+        }
+    }
+
+    /// Assuming other is on same or parent folder !!!
+    fn is_covered_by(&self, other: &UpdateActionKind, other_is_parent: bool) -> bool {
+        match &self.kind {
+            UpdateActionKind::RefreshFolder => match other {
+                UpdateActionKind::RefreshFolder => !other_is_parent,
+                UpdateActionKind::RefreshFolderRecursive => true,
+                UpdateActionKind::RemoveFolder => true,
+                UpdateActionKind::RenameFolder { .. } => false,
+            },
+            UpdateActionKind::RefreshFolderRecursive => match other {
+                UpdateActionKind::RefreshFolder => false,
+                UpdateActionKind::RefreshFolderRecursive => true,
+                UpdateActionKind::RemoveFolder => true,
+                UpdateActionKind::RenameFolder { .. } => false,
+            },
+            UpdateActionKind::RemoveFolder => match other {
+                UpdateActionKind::RefreshFolder => false,
+                UpdateActionKind::RefreshFolderRecursive => false,
+                UpdateActionKind::RemoveFolder => true,
+                UpdateActionKind::RenameFolder { .. } => false,
+            },
+            UpdateActionKind::RenameFolder { .. } => false,
+        }
+    }
 }
 
 impl AsRef<Path> for UpdateAction {
     fn as_ref(&self) -> &Path {
-        match self {
-            UpdateAction::RefreshFolder(folder) => folder.as_path(),
-            UpdateAction::RefreshFolderRecursive(folder) => folder.as_path(),
-            UpdateAction::RemoveFolder(folder) => folder.as_path(),
-            UpdateAction::RenameFolder { from, .. } => from.as_path(),
+        self.path.as_path()
+    }
+}
+
+#[derive(Debug)]
+pub enum Modification {
+    Created,
+    Deleted,
+    Modified,
+    MovedTo(PathBuf),
+}
+
+impl Modification {
+    fn from_event_kind(kind: EventKind, other_path: Option<PathBuf>) -> Option<Self> {
+        match kind {
+            EventKind::Create(_) => Some(Self::Created),
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)) => Some(Self::Deleted),
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)) => Some(Self::Created),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => other_path.map(Self::MovedTo),
+            EventKind::Modify(_) => Some(Modification::Modified),
+            EventKind::Remove(_) => Some(Self::Deleted),
+            _ => None,
         }
     }
+}
+#[derive(Debug)]
+struct PendingEvent {
+    last_change: Instant,
+    change_type: Modification,
 }
 
 pub(super) struct OngoingUpdater {
-    queue: Receiver<Option<UpdateAction>>,
+    input_channel: Receiver<Option<Event>>,
     inner: Arc<CacheInner>,
-    pending: HashMap<UpdateAction, SystemTime>,
+    pending: HashMap<PathBuf, PendingEvent>,
     interval: Duration,
+    update_sender: Sender<Option<UpdateAction>>,
 }
 
 impl OngoingUpdater {
-    pub(super) fn new(queue: Receiver<Option<UpdateAction>>, inner: Arc<CacheInner>) -> Self {
+    pub(super) fn new(
+        channel: Receiver<Option<Event>>,
+        update_sender: Sender<Option<UpdateAction>>,
+        inner: Arc<CacheInner>,
+        debounce_interval: u32,
+    ) -> Self {
         OngoingUpdater {
-            queue,
+            input_channel: channel,
             inner,
             pending: HashMap::new(),
-            interval: Duration::from_secs(10),
+            interval: Duration::from_secs(debounce_interval as u64),
+            update_sender,
         }
     }
 
-    fn finish(self) {
-        let inner = self.inner;
-        self.pending
-            .into_iter()
-            .for_each(|(a, _)| inner.proceed_update(a))
+    fn send_update_actions(&mut self, all: bool) {
+        if !self.pending.is_empty() {
+            let capacity = self.pending.capacity();
+            let done = std::mem::take(&mut self.pending).into_iter();
+            let mut done = if all {
+                done.collect::<Vec<_>>()
+            } else {
+                let now = Instant::now();
+                let mut expired = Vec::with_capacity(capacity);
+                for (path, evt) in done {
+                    if now.duration_since(evt.last_change) < self.interval {
+                        self.pending.insert(path, evt);
+                    } else {
+                        expired.push((path, evt))
+                    }
+                }
+                expired
+            };
+
+            done.sort_unstable_by(|(path_a, evt_a), (path_b, evt_b)| {
+                let comparison = path_a.cmp(path_b);
+
+                if let Ordering::Equal = comparison {
+                    evt_a.last_change.cmp(&evt_b.last_change)
+                } else {
+                    comparison
+                }
+            });
+
+            let mut actions: IndexMap<PathBuf, UpdateActionKind> = IndexMap::new();
+
+            for (path, evt) in done.into_iter() {
+                trace!("Notify debounced event: {:?} {:?}", path, evt);
+                let event_actions = self.list_actions_for_event(&path, evt);
+                for action in event_actions.into_iter() {
+                    let parent = action.path.parent();
+
+                    if let Some(existing_action) = parent.and_then(|path| actions.get(path)) {
+                        if action.is_covered_by(existing_action, true) {
+                            continue;
+                        }
+                    }
+
+                    if let Some(existing_action) = actions.get(&action.path) {
+                        if action.is_covered_by(existing_action, false) {
+                            continue;
+                        }
+                    }
+
+                    actions.insert(action.path, action.kind);
+                }
+            }
+
+            for (path, kind) in actions.into_iter() {
+                let action = UpdateAction::new(path, kind);
+                self.update_sender
+                    .send(Some(action))
+                    .unwrap_or_else(|_| error!("Update receiver removed early"));
+            }
+        }
     }
 
-    pub(super) fn run(mut self) {
+    fn list_actions_for_event(&self, path: &Path, evt: PendingEvent) -> Vec<UpdateAction> {
+        let mut result = Vec::new();
+        let col_path = self.inner.strip_base(&path);
+
+        match evt.change_type {
+            Modification::Created => {
+                if self.inner.path_type(path).is_dir() {
+                    result.push(UpdateAction::new(
+                        col_path,
+                        UpdateActionKind::RefreshFolderRecursive,
+                    ));
+                }
+                result.push(UpdateAction::new(
+                    self.inner.get_true_parent(col_path, path),
+                    UpdateActionKind::RefreshFolder,
+                ));
+            }
+            Modification::Modified => {
+                // TODO: check logic
+                if self.inner.path_type(path).is_dir() {
+                    // should be single file folder
+                    result.push(UpdateAction::new(col_path, UpdateActionKind::RefreshFolder));
+                } else {
+                    result.push(UpdateAction::new(
+                        self.inner.get_true_parent(col_path, path),
+                        UpdateActionKind::RefreshFolder,
+                    ));
+                }
+            }
+            Modification::Deleted => {
+                if self.inner.path_type(path).is_dir() {
+                    result.push(UpdateAction::new(col_path, UpdateActionKind::RemoveFolder));
+                    result.push(UpdateAction::new(
+                        parent_path(col_path),
+                        UpdateActionKind::RefreshFolder,
+                    ));
+                } else {
+                    result.push(UpdateAction::new(
+                        self.inner.get_true_parent(col_path, path),
+                        UpdateActionKind::RefreshFolder,
+                    ))
+                }
+            }
+            Modification::MovedTo(to_path) => {
+                if self.inner.path_type(path).is_dir() {
+                    if self.inner.is_collapsable_folder(&to_path) {
+                        result.push(UpdateAction::new(col_path, UpdateActionKind::RemoveFolder));
+                    } else {
+                        let dest_path = self.inner.strip_base(&to_path).into();
+                        result.push(UpdateAction::new(
+                            col_path,
+                            UpdateActionKind::RenameFolder { to: dest_path },
+                        ));
+                    }
+                    let orig_parent = parent_path(col_path);
+                    let new_parent = parent_path(self.inner.strip_base(&to_path));
+                    let parents_differs = new_parent != orig_parent;
+                    result.push(UpdateAction::new(
+                        orig_parent,
+                        UpdateActionKind::RefreshFolder,
+                    ));
+                    if parents_differs {
+                        result.push(UpdateAction::new(
+                            new_parent,
+                            UpdateActionKind::RefreshFolder,
+                        ));
+                    }
+                } else {
+                    result.push(UpdateAction::new(
+                        self.inner.get_true_parent(col_path, path),
+                        UpdateActionKind::RefreshFolder,
+                    ));
+                    let dest_path = self.inner.strip_base(&to_path);
+                    if self.inner.path_type(&to_path).is_dir() {
+                        result.push(UpdateAction::new(
+                            parent_path(dest_path),
+                            UpdateActionKind::RefreshFolder,
+                        ));
+                        result.push(UpdateAction::new(
+                            dest_path,
+                            UpdateActionKind::RefreshFolderRecursive,
+                        ))
+                    } else {
+                        result.push(UpdateAction::new(
+                            self.inner.get_true_parent(dest_path, &to_path),
+                            UpdateActionKind::RefreshFolder,
+                        ))
+                    }
+                }
+            }
+        };
+
+        result
+    }
+
+    fn insert_event(&mut self, event: Event) {
+        if event.paths.is_empty() {
+            error!("Event {:?} without path", event);
+            return;
+        }
+
+        let mut paths_iter = event.paths.into_iter();
+        let path = paths_iter.next().unwrap(); // safe as we checked emptiness of Vec before
+                                               // debounce delete folder - can delete all events in it
+        if let EventKind::Remove(RemoveKind::Folder) = event.kind {
+            self.pending.retain(|p, _| p.starts_with(&path));
+        }
+
+        let detected_modification = Modification::from_event_kind(event.kind, paths_iter.next());
+        let detected_modification = match detected_modification {
+            Some(m) => m,
+            None => {
+                warn!(
+                    "Event without modification detected: {:?} on {:?}",
+                    event.kind, path
+                );
+                return;
+            }
+        };
+        if let Modification::MovedTo(ref path) = detected_modification {
+            //delete change in moved to, as contained in this change
+            self.pending.remove(path);
+        }
+
+        let now = Instant::now();
+        let entry = self.pending.entry(path);
+        let mut to_be_deleted: Option<PathBuf> = None;
+        match entry {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                let mut delete_this = false;
+                let entry = entry.and_modify(|evt| {
+                    evt.last_change = now;
+                    match (&evt.change_type, &detected_modification) {
+                        // do not overwrite creation with modification
+                        (Modification::Created, Modification::Modified) => (),
+                        // if was created and then deleted can remove it from events
+                        (Modification::Created, Modification::Deleted) => {
+                            delete_this = true;
+                        }
+                        _ => evt.change_type = detected_modification,
+                    };
+                });
+
+                if delete_this {
+                    to_be_deleted = Some(entry.key().clone());
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(_) => {
+                entry.or_insert(PendingEvent {
+                    last_change: now,
+                    change_type: detected_modification,
+                });
+            }
+        };
+
+        if let Some(path_to_delete) = to_be_deleted {
+            self.pending.remove(&path_to_delete);
+        }
+    }
+
+    pub(super) fn run_event_loop(mut self) {
         loop {
-            match self.queue.recv_timeout(self.interval) {
+            match self.input_channel.recv_timeout(self.interval) {
                 Ok(Some(action)) => {
-                    self.pending.insert(action, SystemTime::now());
+                    self.insert_event(action);
+
+                    if self.pending.len() >= 10_000 {
+                        // should not grow too big
+                        self.send_update_actions(false);
+                    }
                 }
                 Ok(None) => {
-                    self.finish();
+                    self.send_update_actions(true);
+                    self.update_sender.send(None).ok(); // TODO: consider do we want to finish update actions or rather finish quickly
                     return;
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     error!("OngoingUpdater channel disconnected preliminary");
-                    self.finish();
+                    self.send_update_actions(true);
                     return;
                 }
-                Err(RecvTimeoutError::Timeout) => (), // just give chance to send pending actions
+                Err(RecvTimeoutError::Timeout) => {
+                    //every pending action is older then limit
+                    self.send_update_actions(false);
+                }
             }
-            let current_time = SystemTime::now();
-            // TODO replace with drain_filter when becomes stable
-            let mut ready = self
-                .pending
-                .iter()
-                .filter(|(_, time)| current_time.duration_since(**time).unwrap() > self.interval)
-                .map(|v| (v.1.clone(), v.0.clone()))
-                .collect::<Vec<_>>();
-            ready.sort_unstable_by_key(|i| i.0);
-            ready.into_iter().for_each(|(_, a)| {
-                self.pending.remove(&a);
-                self.inner.proceed_update(a)
-            })
         }
     }
 }
@@ -149,24 +434,111 @@ impl<'a> RecursiveUpdater<'a> {
     }
 }
 
-pub(crate) enum FilteredEvent {
-    Pass(DebouncedEvent),
-    Error(notify::Error, Option<PathBuf>),
-    Rescan,
-    Ignore,
+#[cfg(test)]
+mod tests {
+    use super::{UpdateAction, UpdateActionKind};
+    use std::path::PathBuf;
+
+    fn action(path: &str, kind: UpdateActionKind) -> UpdateAction {
+        UpdateAction::new(PathBuf::from(path), kind)
+    }
+
+    #[test]
+    fn test_refresh_folder_covered_by_same_refresh() {
+        let a = action("music/rock", UpdateActionKind::RefreshFolder);
+        // Same path (other_is_parent=false) → covered
+        assert!(a.is_covered_by(&UpdateActionKind::RefreshFolder, false));
+        // Parent path (other_is_parent=true) → not covered
+        assert!(!a.is_covered_by(&UpdateActionKind::RefreshFolder, true));
+    }
+
+    #[test]
+    fn test_refresh_folder_covered_by_recursive_and_remove() {
+        let a = action("music/rock", UpdateActionKind::RefreshFolder);
+        assert!(a.is_covered_by(&UpdateActionKind::RefreshFolderRecursive, false));
+        assert!(a.is_covered_by(&UpdateActionKind::RefreshFolderRecursive, true));
+        assert!(a.is_covered_by(&UpdateActionKind::RemoveFolder, false));
+        assert!(a.is_covered_by(&UpdateActionKind::RemoveFolder, true));
+    }
+
+    #[test]
+    fn test_refresh_folder_not_covered_by_rename() {
+        let a = action("music/rock", UpdateActionKind::RefreshFolder);
+        assert!(!a.is_covered_by(
+            &UpdateActionKind::RenameFolder {
+                to: PathBuf::from("music/punk")
+            },
+            false
+        ));
+    }
+
+    #[test]
+    fn test_refresh_recursive_coverage() {
+        let a = action("music/rock", UpdateActionKind::RefreshFolderRecursive);
+        assert!(a.is_covered_by(&UpdateActionKind::RefreshFolderRecursive, false));
+        assert!(a.is_covered_by(&UpdateActionKind::RefreshFolderRecursive, true));
+        assert!(a.is_covered_by(&UpdateActionKind::RemoveFolder, false));
+        // Plain RefreshFolder never covers RefreshFolderRecursive
+        assert!(!a.is_covered_by(&UpdateActionKind::RefreshFolder, false));
+        assert!(!a.is_covered_by(&UpdateActionKind::RefreshFolder, true));
+    }
+
+    #[test]
+    fn test_remove_folder_coverage() {
+        let a = action("music/rock", UpdateActionKind::RemoveFolder);
+        assert!(a.is_covered_by(&UpdateActionKind::RemoveFolder, false));
+        assert!(!a.is_covered_by(&UpdateActionKind::RefreshFolder, false));
+        assert!(!a.is_covered_by(&UpdateActionKind::RefreshFolderRecursive, false));
+        assert!(!a.is_covered_by(
+            &UpdateActionKind::RenameFolder {
+                to: PathBuf::from("music/punk")
+            },
+            false
+        ));
+    }
+
+    #[test]
+    fn test_rename_folder_never_covered() {
+        // RenameFolder is never suppressed: it also updates the rename target side,
+        // so skipping it could leave the destination path without a cache entry.
+        let a = action(
+            "music/rock",
+            UpdateActionKind::RenameFolder {
+                to: PathBuf::from("music/punk"),
+            },
+        );
+        assert!(!a.is_covered_by(&UpdateActionKind::RefreshFolder, false));
+        assert!(!a.is_covered_by(&UpdateActionKind::RefreshFolderRecursive, false));
+        assert!(!a.is_covered_by(&UpdateActionKind::RemoveFolder, false));
+        assert!(!a.is_covered_by(
+            &UpdateActionKind::RenameFolder {
+                to: PathBuf::from("music/other")
+            },
+            false
+        ));
+    }
 }
 
-pub(crate) fn filter_event(evt: DebouncedEvent) -> FilteredEvent {
+pub(crate) enum FilteredEvent {
+    Pass(Event),
+    Error(notify::Error, Option<PathBuf>),
+    Ignore,
+    Rescan,
+}
+
+pub(crate) fn filter_event(evt: Result<Event, notify::Error>) -> FilteredEvent {
     use FilteredEvent::*;
     match evt {
-        DebouncedEvent::NoticeWrite(_) => Ignore,
-        DebouncedEvent::NoticeRemove(_) => Ignore,
-        evt @ DebouncedEvent::Create(_) => Pass(evt),
-        evt @ DebouncedEvent::Write(_) => Pass(evt),
-        DebouncedEvent::Chmod(_) => Ignore,
-        evt @ DebouncedEvent::Remove(_) => Pass(evt),
-        evt @ DebouncedEvent::Rename(_, _) => Pass(evt),
-        DebouncedEvent::Rescan => Rescan,
-        DebouncedEvent::Error(e, p) => Error(e, p),
+        Ok(evt) => {
+            if evt.need_rescan() {
+                Rescan
+            } else {
+                match evt.kind {
+                    EventKind::Any | EventKind::Access(_) | EventKind::Other => Ignore,
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => Pass(evt),
+                }
+            }
+        }
+        Err(e) => Error(e, None),
     }
 }

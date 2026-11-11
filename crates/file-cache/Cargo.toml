@@ -2,26 +2,23 @@
 name = "simple-file-cache"
 version = "0.2.2"
 authors = ["Ivan <ivan.zderadicka@gmail.com>"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-linked-hash-map = "0.5.4"
-#filetime = "0.2"
-rand = "0.8"
-data-encoding = "2.3"
-thiserror ="1.0"
+linked-hash-map = "0.5.6"
+rand = "0.10"
+data-encoding = "2.6"
+thiserror.workspace = true
 log = "0.4"
-byteorder = "1.4"
+byteorder = "1.5"
 
-tokio = { version="1.2", optional=true, features=[ "rt", "fs"] }
+tokio = { version = "1.37", optional = true, features = ["rt", "fs"] }
 
 
 [features]
 asynch = ["tokio"]
 
 [dev-dependencies]
-env_logger = "0.9"
-tempfile ="3.2"
-tokio = { version="1.2", features=["io-util", "macros",] }
-
-
+env_logger = "0.11.3"
+tempfile = "3.16.0"
+tokio = { version = "1.37", features = ["io-util", "macros"] }

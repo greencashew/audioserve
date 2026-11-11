@@ -1,8 +1,9 @@
+use crate::FileModTime;
+
 use super::{error::Error, CacheInner};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use tokio;
 use tokio::task::spawn_blocking;
 
 impl From<tokio::task::JoinError> for Error {
@@ -37,19 +38,23 @@ impl Cache {
         (c.max_files - c.num_files, c.max_size - c.size)
     }
 
-    pub async fn add<S: AsRef<str>>(&self, key: S) -> Result<(tokio::fs::File, Finisher)> {
+    pub async fn add<S: AsRef<str>>(
+        &self,
+        key: S,
+        mtime: FileModTime,
+    ) -> Result<(tokio::fs::File, Finisher)> {
         let cache = self.inner.clone();
         let key = key.as_ref().to_string();
         spawn_blocking(move || {
             let mut c = cache.write().expect("Cannot lock cache");
-            c.add(key.clone())
+            c.add(key.clone(), mtime)
                 .and_then(|f| f.try_clone().map_err(|e| e.into()).map(|f2| (f, f2)))
                 .map(|(f, f2)| {
                     (
                         tokio::fs::File::from_std(f),
                         Finisher {
                             cache: cache.clone(),
-                            key: key,
+                            key,
                             file: f2,
                         },
                     )
@@ -58,12 +63,16 @@ impl Cache {
         .await?
     }
 
-    pub async fn get<S: AsRef<str>>(&self, key: S) -> Result<Option<tokio::fs::File>> {
+    pub async fn get<S: AsRef<str>>(
+        &self,
+        key: S,
+        mtime: FileModTime,
+    ) -> Result<Option<tokio::fs::File>> {
         let key = key.as_ref().to_string();
         let inner = self.inner.clone();
         let r = spawn_blocking(move || {
             let mut c = inner.write().expect("Cannot lock cache");
-            c.get(key).map(|f| f.map(|f| tokio::fs::File::from_std(f)))
+            c.get(key, mtime).map(|f| f.map(tokio::fs::File::from_std))
         })
         .await?;
         invert(r)
@@ -72,12 +81,13 @@ impl Cache {
     pub async fn get2<S: AsRef<str>>(
         &self,
         key: S,
+        mtime: FileModTime,
     ) -> Result<Option<(tokio::fs::File, std::path::PathBuf)>> {
         let cache = self.inner.clone();
         let key = key.as_ref().to_string();
         let r = spawn_blocking(move || {
             let mut c = cache.write().expect("Cannot lock cache");
-            c.get2(key)
+            c.get2(key, mtime)
                 .map(|f| f.map(|(f, path)| (tokio::fs::File::from_std(f), path)))
         })
         .await?;
@@ -129,11 +139,11 @@ mod tests {
     const MY_KEY: &str = "muj_test_1";
     const MSG: &str = "Hello there you lonely bastard";
 
-    async fn cache_rw(c: Cache) -> Result<()> {
-        let (mut f, fin) = c.add(MY_KEY).await?;
+    async fn cache_rw(c: Cache, t: FileModTime) -> Result<()> {
+        let (mut f, fin) = c.add(MY_KEY, t).await?;
         f.write_all(MSG.as_bytes()).await?;
         fin.commit().await?;
-        match c.get(MY_KEY).await? {
+        match c.get(MY_KEY, t).await? {
             None => panic!("cache file not found"),
             Some(mut f) => {
                 let mut v = Vec::new();
@@ -153,11 +163,11 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let c = Cache::new(temp_dir.path(), 10000, 10).unwrap();
         let c2 = c.clone();
-        cache_rw(c).await.unwrap();
-        let mut f = c2.get(MY_KEY).await.unwrap().unwrap();
+        let t = FileModTime::now();
+        cache_rw(c, t).await.unwrap();
+        let mut f = c2.get(MY_KEY, t).await.unwrap().unwrap();
         let mut s = String::new();
         f.read_to_string(&mut s).await.unwrap();
         assert_eq!(MSG, s);
-        ()
     }
 }

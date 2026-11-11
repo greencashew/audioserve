@@ -1,45 +1,47 @@
-FROM alpine:3.14 AS build
+# check=error=true
+
+ARG CARGO_ARGS
+ARG CARGO_RELEASE="release"
+
+FROM alpine:3.23 AS build
 LABEL maintainer="Ivan <ivan@zderadicka.eu>"
 
 ARG CARGO_ARGS
-
+ARG CARGO_RELEASE
 
 RUN apk update &&\
-    apk add git bash openssl openssl-dev curl yasm build-base \
-    wget libbz2 bzip2-dev  zlib zlib-dev rust cargo ffmpeg-dev ffmpeg
+    apk add git bash curl yasm build-base pkgconfig \
+    wget libbz2 bzip2-dev zlib zlib-dev rust cargo ffmpeg-dev ffmpeg
 
 COPY . /audioserve 
 WORKDIR /audioserve
 
-RUN cargo build --release ${CARGO_ARGS} &&\
-    cargo test --release ${CARGO_ARGS}
+RUN if [[ -n "$CARGO_RELEASE" ]]; then CARGO_RELEASE="--$CARGO_RELEASE"; fi && \
+    echo BUILDING: cargo build ${CARGO_RELEASE} ${CARGO_ARGS} && \
+    cargo build ${CARGO_RELEASE} ${CARGO_ARGS} &&\
+    cargo test ${CARGO_RELEASE} --all ${CARGO_ARGS}
 
-RUN mkdir /ssl &&\
-    cd /ssl &&\
-    openssl req -newkey rsa:2048 -nodes -keyout key.pem -x509 -days 365 -out certificate.pem \
-        -subj "/C=CZ/ST=Prague/L=Prague/O=Ivan/CN=audioserve" &&\
-    openssl pkcs12 -inkey key.pem -in certificate.pem -export  -passout pass:mypass -out audioserve.p12 
+FROM node:24-alpine AS client
 
-FROM node:12-alpine as client
-
-COPY ./client /audioserve_client
-
-RUN cd audioserve_client &&\
+RUN apk add git &&\
+    git clone https://github.com/izderadicka/audioserve-web.git /audioserve_client &&\
+    cd /audioserve_client &&\
     npm install &&\
-    npm run build
+    npm run build-sw &&\
+    npm run build &&\
+    ./compress_dist.sh
 
-FROM alpine:3.14
+FROM alpine:3.23
 
-VOLUME /audiobooks
-COPY --from=build /audioserve/target/release/audioserve /audioserve/audioserve
+ARG CARGO_ARGS
+ARG CARGO_RELEASE
+
+COPY --from=build /audioserve/target/${CARGO_RELEASE:-debug}/audioserve /audioserve/audioserve
 COPY --from=client /audioserve_client/dist /audioserve/client/dist
-COPY --from=build /ssl/audioserve.p12 /audioserve/ssl/audioserve.p12
 
 RUN adduser -D -u 1000 audioserve &&\
     chown -R audioserve:audioserve /audioserve &&\
-    apk update &&\
-    apk add libssl1.1 taglib \
-    libbz2 zlib ffmpeg
+    apk --no-cache add libbz2 zlib ffmpeg
 
 WORKDIR /audioserve
 USER audioserve

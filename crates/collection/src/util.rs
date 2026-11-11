@@ -1,13 +1,10 @@
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{DirEntry, Metadata};
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
+use std::{io, thread};
 
 use mime_guess::Mime;
-
-use crate::common::CollectionOptions;
 
 pub fn guess_mime_type<P: AsRef<Path>>(path: P) -> Mime {
     mime_guess::from_path(path).first_or_octet_stream()
@@ -85,12 +82,11 @@ pub fn get_real_file_type<P: AsRef<Path>>(
     dir_entry.file_type()
 }
 
-pub fn is_no_cache_collection<P: AsRef<Path>>(
-    col_options: &HashMap<PathBuf, CollectionOptions>,
-    col_path: P,
-) -> bool {
-    col_options
-        .get(col_path.as_ref())
-        .map(|o| o.no_cache)
-        .unwrap_or(false)
+pub fn spawn_named_thread<F, T>(name: impl Into<String>, f: F) -> thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let builder = thread::Builder::new().name(name.into()); //TODO: consider setting stack size 1M
+    builder.spawn(f).expect("Invalid thread name")
 }

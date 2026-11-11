@@ -1,7 +1,68 @@
+use std::{env, process::Command};
+
 fn main() {
-    #[cfg(feature = "static")]
-    {
-        println!("cargo:rustc-link-lib=static=ssl");
-        println!("cargo:rustc-link-lib=static=crypto");
-    }
+    let commit = get_commit();
+    let commit_date = get_commit_date();
+    println!(
+        "cargo:rustc-env=AUDIOSERVE_LONG_VERSION={}",
+        get_long_version(&commit, &commit_date)
+    );
+    println!("cargo:rustc-env=AUDIOSERVE_COMMIT={}", commit);
+    println!(
+        "cargo:rustc-env=AUDIOSERVE_COMMIT_WITH_DATE={} ({})",
+        commit, commit_date
+    );
+    println!("cargo:rustc-env=AUDIOSERVE_FEATURES={}", get_features());
+}
+
+fn get_long_version(commit: &str, commit_date: &str) -> String {
+    let ver = env::var("CARGO_PKG_VERSION").expect("cargo version is missing");
+    format!("{} #{} ({})", ver, commit, commit_date)
+}
+
+const FEATURE_PREFIX: &str = "CARGO_FEATURE_";
+
+fn get_features() -> String {
+    env::vars()
+        .filter_map(|(v, _)| v.strip_prefix(FEATURE_PREFIX).map(|s| s.to_string()))
+        .map(|f| f.to_ascii_lowercase().replace('_', "-"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn get_commit() -> String {
+    Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map(|mut o| {
+            o.stdout.truncate(7);
+            String::from_utf8(o.stdout).expect("git output must be utf-8")
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("Error running git: {}", e);
+            "?".to_string()
+        })
+}
+
+fn get_commit_date() -> String {
+    Command::new("git")
+        .args([
+            "log",
+            "-1",
+            "--format=%cd",
+            "--date=format:%d.%m.%Y %H:%M:%S",
+            "HEAD",
+        ])
+        .output()
+        .map(|mut o| {
+            // trim trailing newline
+            while o.stdout.last() == Some(&b'\n') || o.stdout.last() == Some(&b'\r') {
+                o.stdout.pop();
+            }
+            String::from_utf8(o.stdout).expect("git output must be utf-8")
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("Error running git: {}", e);
+            "?".to_string()
+        })
 }

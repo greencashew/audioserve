@@ -3,11 +3,12 @@
 **/*.rs.bk
 .vscode
 *.old
-/client/node_modules
 npm-debug.log
-client/dist/bundle.js
 *.log
 rls/
 _static_build
 /crates/**/Cargo.lock
-client/dist/bundle.js.LICENSE.txt
+lcov.info
+/target-test
+mutants.out
+.claude

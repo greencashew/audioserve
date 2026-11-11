@@ -27,7 +27,10 @@ pub enum Error {
     IOError(#[from] std::io::Error),
 
     #[error("Bincode serialization error: {0}")]
-    BincodeError(#[from] Box<bincode::ErrorKind>),
+    BincodeEncodeError(#[from] bincode::error::EncodeError),
+
+    #[error("Bincode deserialization error: {0}")]
+    BincodeDecodeError(#[from] bincode::error::DecodeError),
 
     #[error("Missing Collection Cache: {0}")]
     MissingCollectionCache(usize),
@@ -53,7 +56,36 @@ pub enum Error {
 
     #[error("JSON schema error: {0}")]
     JsonDataError(String),
+
+    #[error("Invalid collection option: {0}")]
+    InvalidCollectionOption(String),
+
+    #[error("Invalid regex for CD folder: {0} {1}")]
+    InvalidCDFolderRegex(String, regex::Error),
+
+    #[cfg(feature = "collation")]
+    #[error("Invalid locale string: {0}")]
+    InvalidLocale(#[from] icu::locale::ParseError),
+
+    #[cfg(feature = "collation")]
+    #[error("Invalid Collation Data: {0}")]
+    InvalidCollationData(String),
 }
+
+macro_rules! invalid_option_err {
+    ($fmt: literal, $($param: expr),*) => {
+       crate::error::Error::InvalidCollectionOption(format!($fmt, $($param),*))
+    };
+}
+
+macro_rules! invalid_option {
+    ($fmt: literal, $($param: expr),*) => {
+        return Err(invalid_option_err!($fmt, $($param),*))
+    };
+}
+
+pub(crate) use invalid_option;
+pub(crate) use invalid_option_err;
 
 impl From<TransactionError<Error>> for Error {
     fn from(e: TransactionError<Error>) -> Self {

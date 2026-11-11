@@ -1,6 +1,6 @@
 #![allow(dead_code)]
-/**
- ffmpeg suported tags:
+/*
+ ffmpeg supported tags:
 
 album        -- name of the set this work belongs to
 album_artist -- main creator of the set/album, if different from artist.
@@ -29,6 +29,13 @@ title        -- name of the work.
 track        -- number of this work in the set, can be in form current/total.
 variant_bitrate -- the total bitrate of the bitrate variant that the current stream is part of
 
+Following tags are not from ffmpeg documentation, but work for some formats mpeg4 aka .m4b
+series       -- name of the audiobook series
+series_sequence -- specifies the part of the series
+show         -- alias for 'series'
+episode_id   -- alias for 'series_sequence'
+season_number -- specific "season" grouping part within the show/series
+
  */
 
 pub const ALBUM: &str = "album";
@@ -52,6 +59,11 @@ pub const SERVICE_PROVIDER: &str = "service_provider";
 pub const TITLE: &str = "title";
 pub const TRACK: &str = "track";
 pub const VARIANT_BITRATE: &str = "variant_bitrate";
+pub const SERIES: &str = "series";
+pub const SERIES_SEQUENCE: &str = "series_sequence";
+pub const SHOW: &str = "show";
+pub const EPISODE_ID: &str = "episode_id";
+pub const SEASON_NUMBER: &str = "season_number";
 
 pub const ALLOWED_TAGS: &[&str] = &[
     ALBUM,
@@ -75,6 +87,11 @@ pub const ALLOWED_TAGS: &[&str] = &[
     TITLE,
     TRACK,
     VARIANT_BITRATE,
+    SERIES,
+    SERIES_SEQUENCE,
+    SHOW,
+    EPISODE_ID,
+    SEASON_NUMBER,
 ];
 
 pub const BASIC_TAGS: &[&str] = &[ALBUM, ARTIST, COMPOSER, DATE, GENRE, PERFORMER, TITLE];

@@ -1,238 +1,48 @@
 use self::auth::{AuthResult, Authenticator};
 use self::search::Search;
-use self::subs::{
-    collections_list, get_folder, recent, search, send_file, send_file_simple, transcodings_list,
-    ResponseFuture,
-};
 use self::transcode::QualityLevel;
-use crate::config::get_config;
-use crate::util::ResponseBuilderExt;
-use crate::{error, util::header2header};
-use bytes::{Bytes, BytesMut};
-use collection::{Collections, FoldersOrdering};
-use futures::prelude::*;
-use futures::{future, TryFutureExt};
-use headers::{
-    AccessControlAllowCredentials, AccessControlAllowHeaders, AccessControlAllowMethods,
-    AccessControlAllowOrigin, AccessControlMaxAge, AccessControlRequestHeaders, HeaderMapExt,
-    Origin, Range,
+use crate::config::{get_config, Cors};
+use crate::error;
+use crate::services::api::{json_body, sign_path};
+use crate::services::auth::signed_url::SignedUrlService;
+use crate::services::transcode::ChosenTranscoding;
+use myhy::request::{is_cors_matching_origin, HttpRequest, QueryParams, RequestWrapper};
+use myhy::response::body::HttpBody;
+use myhy::response::{
+    self,
+    cors::{add_cors_headers, preflight_cors_response},
+    file::send_static_file,
+    HttpResponse, ResponseFuture, ResponseResult,
 };
-use hyper::StatusCode;
-use hyper::{body::HttpBody, service::Service, Body, Method, Request, Response};
+
+use collection::{Collections, FoldersOrdering};
+use futures::{future, TryFutureExt};
 use leaky_cauldron::Leaky;
-use percent_encoding::percent_decode;
+use myhy::headers::{HeaderMapExt, Origin, Range, UserAgent};
+use myhy::Incoming;
+use myhy::Method;
+use myhy::Service;
+
 use regex::Regex;
-use std::iter::FromIterator;
-use std::time::Duration;
 use std::{
-    borrow::Cow,
-    collections::HashMap,
-    convert::Infallible,
-    fmt::Display,
-    net::IpAddr,
     net::SocketAddr,
     path::{Path, PathBuf},
-    pin::Pin,
     sync::{atomic::AtomicUsize, Arc},
-    task::Poll,
 };
-use url::form_urlencoded;
+use tokio::sync::watch;
 
+pub mod api;
 pub mod auth;
+mod files;
+pub mod icon;
 #[cfg(feature = "shared-positions")]
 pub mod position;
-pub mod resp;
 pub mod search;
-mod subs;
 pub mod transcode;
 mod types;
 
-const APP_STATIC_FILES_CACHE_AGE: u32 = 30 * 24 * 3600;
-const FOLDER_INFO_FILES_CACHE_AGE: u32 = 24 * 3600;
-
 type Counter = Arc<AtomicUsize>;
 
-#[derive(Debug)]
-pub enum RemoteIpAddr {
-    Direct(IpAddr),
-    #[allow(dead_code)]
-    Proxied(IpAddr),
-}
-
-impl AsRef<IpAddr> for RemoteIpAddr {
-    fn as_ref(&self) -> &IpAddr {
-        match self {
-            RemoteIpAddr::Direct(a) => a,
-            RemoteIpAddr::Proxied(a) => a,
-        }
-    }
-}
-
-impl Display for RemoteIpAddr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RemoteIpAddr::Direct(a) => a.fmt(f),
-            RemoteIpAddr::Proxied(a) => write!(f, "Proxied: {}", a),
-        }
-    }
-}
-
-pub struct RequestWrapper {
-    request: Request<Body>,
-    path: String,
-    remote_addr: Option<IpAddr>,
-    #[allow(dead_code)]
-    is_ssl: bool,
-    #[allow(dead_code)]
-    is_behind_proxy: bool,
-}
-
-impl RequestWrapper {
-    pub fn new(
-        request: Request<Body>,
-        path_prefix: Option<&str>,
-        remote_addr: Option<IpAddr>,
-        is_ssl: bool,
-    ) -> error::Result<Self> {
-        let path = match percent_decode(request.uri().path().as_bytes()).decode_utf8() {
-            Ok(s) => s.into_owned(),
-            Err(e) => {
-                return Err(error::Error::msg(format!(
-                    "Invalid path encoding, not UTF-8: {}",
-                    e
-                )))
-            }
-        };
-        //Check for unwanted path segments - e.g. ., .., .anything - so we do not want special directories and hidden directories and files
-        let mut segments = path.split('/');
-        if segments.any(|s| s.starts_with(".")) {
-            return Err(error::Error::msg(
-                "Illegal path, contains either special directories or hidden name",
-            ));
-        }
-
-        let path = match path_prefix {
-            Some(p) => match crate::util::strip_prefix_of(p, &path) {
-                //TODO: later replace with new std function strip_prefix
-                Some(s) => {
-                    if s.is_empty() {
-                        "/".to_string()
-                    } else {
-                        s.to_string()
-                    }
-                }
-                None => {
-                    error!("URL path is missing prefix {}", p);
-                    return Err(error::Error::msg(format!(
-                        "URL path is missing prefix {}",
-                        p
-                    )));
-                }
-            },
-            None => path,
-        };
-        let is_behind_proxy = get_config().behind_proxy;
-        Ok(RequestWrapper {
-            request,
-            path,
-            remote_addr,
-            is_ssl,
-            is_behind_proxy,
-        })
-    }
-
-    pub fn path(&self) -> &str {
-        self.path.as_str()
-    }
-
-    pub fn remote_addr(&self) -> Option<RemoteIpAddr> {
-        #[cfg(feature = "behind-proxy")]
-        if self.is_behind_proxy {
-            return self
-                .request
-                .headers()
-                .typed_get::<proxy_headers::Forwarded>()
-                .and_then(|fwd| fwd.client().map(|c| c.clone()))
-                .map(|addr| RemoteIpAddr::Proxied(addr))
-                .or_else(|| {
-                    self.request
-                        .headers()
-                        .typed_get::<proxy_headers::XForwardedFor>()
-                        .map(|xfwd| RemoteIpAddr::Proxied(*xfwd.client()))
-                });
-        }
-        self.remote_addr.map(RemoteIpAddr::Direct)
-    }
-
-    pub fn headers(&self) -> &hyper::HeaderMap {
-        self.request.headers()
-    }
-
-    pub fn method(&self) -> &hyper::Method {
-        self.request.method()
-    }
-
-    #[allow(dead_code)]
-    pub fn into_body(self) -> Body {
-        self.request.into_body()
-    }
-
-    pub async fn body_bytes(&mut self) -> Result<Bytes, hyper::Error> {
-        let first = self.request.body_mut().data().await;
-        match first {
-            Some(Ok(data)) => {
-                let mut buf = BytesMut::from(&data[..]);
-                while let Some(res) = self.request.body_mut().data().await {
-                    let next = res?;
-                    buf.extend_from_slice(&next);
-                }
-                Ok(buf.into())
-            }
-            Some(Err(e)) => return Err(e),
-            None => Ok(Bytes::new()),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn into_request(self) -> Request<Body> {
-        self.request
-    }
-
-    pub fn params(&self) -> Option<HashMap<Cow<str>, Cow<str>>> {
-        self.request
-            .uri()
-            .query()
-            .map(|query| form_urlencoded::parse(query.as_bytes()).collect::<HashMap<_, _>>())
-    }
-
-    pub fn is_https(&self) -> bool {
-        if self.is_ssl {
-            return true;
-        }
-        #[cfg(feature = "behind-proxy")]
-        if self.is_behind_proxy {
-            //try scommon  proxy headers
-            let forwarded_https = self
-                .request
-                .headers()
-                .typed_get::<proxy_headers::Forwarded>()
-                .and_then(|fwd| fwd.client_protocol().map(|p| p.as_ref() == "https"))
-                .unwrap_or(false);
-
-            if forwarded_https {
-                return true;
-            }
-
-            return self
-                .request
-                .headers()
-                .get("X-Forwarded-Proto")
-                .map(|v| v.as_bytes() == b"https")
-                .unwrap_or(false);
-        }
-        false
-    }
-}
 #[derive(Clone)]
 pub struct TranscodingDetails {
     pub transcodings: Counter,
@@ -240,11 +50,13 @@ pub struct TranscodingDetails {
 }
 
 pub struct ServiceFactory<T> {
-    authenticator: Option<Arc<Box<dyn Authenticator<Credentials = T>>>>,
+    authenticator: Option<Arc<dyn Authenticator<Incoming, Credentials = T>>>,
     rate_limitter: Option<Arc<Leaky>>,
     search: Search<String>,
     transcoding: TranscodingDetails,
+    path_signing: SignedUrlService,
     collections: Arc<Collections>,
+    stop_service_receiver: watch::Receiver<()>,
 }
 
 impl<T> ServiceFactory<T> {
@@ -253,46 +65,71 @@ impl<T> ServiceFactory<T> {
         search: Search<String>,
         transcoding: TranscodingDetails,
         collections: Arc<Collections>,
+        path_signing: SignedUrlService,
         rate_limit: Option<f32>,
+        stop_service_receiver: watch::Receiver<()>,
     ) -> Self
     where
-        A: Authenticator<Credentials = T> + 'static,
+        A: Authenticator<Incoming, Credentials = T> + 'static,
     {
         ServiceFactory {
             authenticator: auth
-                .map(|a| Arc::new(Box::new(a) as Box<dyn Authenticator<Credentials = T>>)),
+                .map(|a| Arc::new(a) as Arc<dyn Authenticator<Incoming, Credentials = T>>),
             rate_limitter: rate_limit.map(|l| Arc::new(Leaky::new(l))),
             search,
             transcoding,
             collections,
+            path_signing,
+            stop_service_receiver,
+        }
+    }
+}
+
+impl<T> myhy::server::ServiceFactory for ServiceFactory<T>
+where
+    T: Send + 'static,
+{
+    type Body = HttpBody;
+    type Error = error::Error;
+    type Future = ResponseFuture;
+    type Service = MainService<T>;
+
+    fn create(&self, remote_addr: SocketAddr, is_ssl: bool) -> MainService<T> {
+        MainService {
+            state: ServiceComponents {
+                search: self.search.clone(),
+                transcoding: self.transcoding.clone(),
+                collections: self.collections.clone(),
+                path_signing: self.path_signing.clone(),
+            },
+            authenticator: self.authenticator.clone(),
+            rate_limitter: self.rate_limitter.clone(),
+            remote_addr,
+            is_ssl,
         }
     }
 
-    pub fn create(
-        &self,
-        remote_addr: Option<SocketAddr>,
-        is_ssl: bool,
-    ) -> impl Future<Output = Result<FileSendService<T>, Infallible>> {
-        future::ok(FileSendService {
-            authenticator: self.authenticator.clone(),
-            rate_limitter: self.rate_limitter.clone(),
-            search: self.search.clone(),
-            transcoding: self.transcoding.clone(),
-            collections: self.collections.clone(),
-            remote_addr,
-            is_ssl,
-        })
+    fn stop_service_receiver(&self) -> watch::Receiver<()> {
+        self.stop_service_receiver.clone()
     }
 }
 
 #[derive(Clone)]
-pub struct FileSendService<T> {
-    pub authenticator: Option<Arc<Box<dyn Authenticator<Credentials = T>>>>,
-    pub rate_limitter: Option<Arc<Leaky>>,
+pub struct ServiceComponents {
     pub search: Search<String>,
     pub transcoding: TranscodingDetails,
     pub collections: Arc<Collections>,
-    pub remote_addr: Option<SocketAddr>,
+    pub path_signing: SignedUrlService,
+}
+
+type OptionalAuthenticatorType<T> = Option<Arc<dyn Authenticator<Incoming, Credentials = T>>>;
+
+#[derive(Clone)]
+pub struct MainService<T> {
+    pub state: ServiceComponents,
+    pub authenticator: OptionalAuthenticatorType<T>,
+    pub rate_limitter: Option<Arc<Leaky>>,
+    pub remote_addr: SocketAddr,
     pub is_ssl: bool,
 }
 
@@ -301,182 +138,244 @@ fn get_subpath(path: &str, prefix: &str) -> PathBuf {
     Path::new(&path).strip_prefix(prefix).unwrap().to_path_buf()
 }
 
-fn add_cors_headers(
-    mut resp: Response<Body>,
-    origin: Option<Origin>,
-    enabled: bool,
-) -> Response<Body> {
-    if !enabled {
-        return resp;
-    }
-    match origin {
-        Some(o) => {
-            if let Ok(allowed_origin) = header2header::<_, AccessControlAllowOrigin>(o) {
-                let headers = resp.headers_mut();
-                headers.typed_insert(allowed_origin);
-                headers.typed_insert(AccessControlAllowCredentials);
-            }
-            resp
-        }
-        None => resp,
-    }
+const STATIC_FILE_NAMES: &[&str] = &[
+    "/bundle.js",
+    "/bundle.css",
+    "/global.css",
+    "/favicon.png",
+    "/app.webmanifest",
+    "/service-worker.js",
+];
+
+const STATIC_DIR: &str = "/static/";
+
+fn is_static_file(path: &str) -> bool {
+    STATIC_FILE_NAMES.contains(&path) || path.starts_with(STATIC_DIR)
 }
 
-fn preflight_cors_response(req: &Request<Body>) -> Response<Body> {
-    let origin = req.headers().typed_get::<Origin>();
-    const ALLOWED_METHODS: &[Method] = &[Method::GET, Method::POST, Method::OPTIONS];
-
-    let mut resp_builder = Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        // Allow all requested headers
-        .typed_header(AccessControlAllowMethods::from_iter(
-            ALLOWED_METHODS.iter().cloned(),
-        ))
-        .typed_header(AccessControlMaxAge::from(Duration::from_secs(24 * 3600)));
-
-    if let Some(requested_headers) = req.headers().typed_get::<AccessControlRequestHeaders>() {
-        resp_builder = resp_builder.typed_header(AccessControlAllowHeaders::from_iter(
-            requested_headers.iter(),
-        ));
+fn is_cors_enabled_for_request(req: &HttpRequest) -> bool {
+    if let Some(cors) = get_config().cors.as_ref() {
+        match &cors.allow {
+            Cors::AllowAllOrigins => true,
+            Cors::AllowMatchingOrigins(re) => is_cors_matching_origin(req, re),
+        }
+    } else {
+        false
     }
-
-    let resp = resp_builder.body(Body::empty()).unwrap();
-
-    add_cors_headers(resp, origin, true)
 }
 
 #[allow(clippy::type_complexity)]
-impl<C: 'static> Service<Request<Body>> for FileSendService<C> {
-    type Response = Response<Body>;
+impl<C: Send + 'static> Service<HttpRequest> for MainService<C> {
+    type Response = HttpResponse;
     type Error = error::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = ResponseFuture;
 
-    fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
+    fn call(&self, req: HttpRequest) -> Self::Future {
+        let state = self.state.clone();
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
-        Box::pin(self.process_request(req).or_else(|e| {
-            error!("Request processing error: {}", e);
-            future::ok(resp::internal_error())
-        }))
-    }
-}
-
-impl<C: 'static> FileSendService<C> {
-    fn process_request(&mut self, req: Request<Body>) -> ResponseFuture {
         //Limit rate of requests if configured
-        if let Some(limiter) = self.rate_limitter.as_ref() {
-            if let Err(_) = limiter.start_one() {
+        if let Some(ref limiter) = self.rate_limitter {
+            if limiter.start_one().is_err() {
                 debug!("Rejecting request due to rate limit");
-                return resp::fut(resp::too_many_requests);
+                return response::fut(response::too_many_requests);
             }
         }
 
-        // handle OPTIONS method for CORS preflightAtomicUsize
-        if req.method() == Method::OPTIONS && get_config().cors {
+        let cors = is_cors_enabled_for_request(&req);
+
+        // handle OPTIONS method for CORS preflight
+        if req.method() == Method::OPTIONS && cors {
             debug!(
                 "Got OPTIONS request in CORS mode : {} {:?}",
                 req.uri(),
                 req.headers()
             );
-            return Box::pin(future::ok(preflight_cors_response(&req)));
+            return response::fut(|| preflight_cors_response(&req));
         }
 
-        let req = match RequestWrapper::new(
-            req,
-            get_config().url_path_prefix.as_deref(),
-            self.remote_addr.map(|a| a.ip()),
-            self.is_ssl,
-        ) {
+        let path_prefix: Option<&str> = get_config().url_path_prefix.as_deref();
+        let original_uri = req.uri().clone();
+        let req = match RequestWrapper::new(req)
+            .and_then(|req| req.set_path_prefix(path_prefix))
+            .map(|req| {
+                req.set_remote_addr(Some(self.remote_addr.ip()))
+                    .set_is_ssl(self.is_ssl)
+                    .set_is_cors(cors)
+                    .set_is_behind_proxy(get_config().behind_proxy)
+                    .set_can_compress(get_config().compress_responses)
+            }) {
             Ok(r) => r,
             Err(e) => {
-                error!("Request URL error: {}", e);
-                return resp::fut(resp::not_found);
+                error!("Request URL {} error: {}", original_uri, e);
+                return response::fut(response::bad_request);
             }
         };
+
+        if req.path().is_empty() {
+            if let Some(prefix) = path_prefix {
+                return response::fut(|| response::redirect_permanent(&(prefix.to_string() + "/")));
+            }
+        }
+
+        Box::pin(
+            MainService::<C>::process_request(state, self.authenticator.clone(), req).or_else(
+                |e| {
+                    error!("Request processing error: {}", e);
+                    future::ok(response::internal_error())
+                },
+            ),
+        )
+    }
+}
+
+impl<C: Send + 'static> MainService<C> {
+    async fn process_request(
+        subservices: ServiceComponents,
+        authenticator: OptionalAuthenticatorType<C>,
+        req: RequestWrapper,
+    ) -> ResponseResult {
         //static files
         if req.method() == Method::GET {
-            if req.path() == "/" {
-                return send_file_simple(
+            if req.path() == "/" || req.path() == "/index.html" {
+                return send_static_file(
                     &get_config().client_dir,
                     "index.html",
-                    Some(APP_STATIC_FILES_CACHE_AGE),
-                );
-            };
-            if req.path() == "/bundle.js" {
-                return send_file_simple(
+                    get_config().static_resource_cache_age,
+                )
+                .await;
+            } else if is_static_file(req.path()) {
+                return send_static_file(
                     &get_config().client_dir,
-                    "bundle.js",
-                    Some(APP_STATIC_FILES_CACHE_AGE),
-                );
+                    &req.path()[1..],
+                    get_config().static_resource_cache_age,
+                )
+                .await;
+            } else if req.path().starts_with("/pub-icon/") {
+                let params = req.params();
+                let signature = params.get("sig");
+                let expiration: Option<u64> = params.get("exp").and_then(|s| s.parse().ok());
+                if let (Some(sig), Some(exp)) = (signature, expiration) {
+                    if let Err(e) =
+                        subservices
+                            .path_signing
+                            .verify_signature(req.path(), exp, sig.as_ref())
+                    {
+                        error!(
+                            "Invalid pub-icon request signature on path{}: {}",
+                            req.path(),
+                            e
+                        );
+                        return Ok(response::bad_request());
+                    }
+                    let collections = subservices.collections.clone();
+                    let path = req.path().strip_prefix("/pub-icon").unwrap();
+                    let (path, colllection_index) = match extract_collection_number(path) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            error!("Invalid collection number");
+                            return Ok(response::not_found());
+                        }
+                    };
+                    let path = PathBuf::from(path.strip_prefix('/').unwrap());
+                    debug!(
+                        "Sending icon for collection {} path {}",
+                        colllection_index,
+                        path.display()
+                    );
+                    return files::send_folder_icon(colllection_index, path, collections).await;
+                } else {
+                    error!("Invalid pub-icon request: missing signature or expiration");
+                    return Ok(response::bad_request());
+                }
             }
         }
         // from here everything must be authenticated
-        let searcher = self.search.clone();
-        let transcoding = self.transcoding.clone();
-        let cors = get_config().cors;
+        let cors = req.is_cors_enabled();
         let origin = req.headers().typed_get::<Origin>();
 
-        let resp = match self.authenticator {
+        let resp = match authenticator {
             Some(ref auth) => {
-                let collections = self.collections.clone();
-                Box::pin(auth.authenticate(req).and_then(move |result| match result {
-                    AuthResult::Authenticated { request, .. } => {
-                        FileSendService::<C>::process_checked(
-                            request,
-                            searcher,
-                            transcoding,
-                            collections,
-                        )
+                let auth_result = auth.authenticate(req).await;
+
+                match auth_result {
+                    Ok(AuthResult::Authenticated { request, .. }) => {
+                        MainService::<C>::process_authenticated(request, subservices).await
                     }
-                    AuthResult::LoggedIn(resp) | AuthResult::Rejected(resp) => {
-                        Box::pin(future::ok(resp))
-                    }
-                }))
+                    Ok(AuthResult::LoggedIn(resp)) | Ok(AuthResult::Rejected(resp)) => Ok(resp),
+                    Err(e) => Err(e),
+                }
             }
-            None => FileSendService::<C>::process_checked(
-                req,
-                searcher,
-                transcoding,
-                self.collections.clone(),
-            ),
+            None => MainService::<C>::process_authenticated(req, subservices).await,
         };
-        Box::pin(resp.map_ok(move |r| add_cors_headers(r, origin, cors)))
+        resp.map(move |r| if cors { add_cors_headers(r, origin) } else { r })
     }
 
-    fn process_checked(
-        #[allow(unused_mut)] mut req: RequestWrapper,
-        searcher: Search<String>,
-        transcoding: TranscodingDetails,
-        collections: Arc<Collections>,
-    ) -> ResponseFuture {
+    async fn process_authenticated(
+        mut req: RequestWrapper,
+        subservices: ServiceComponents,
+    ) -> ResponseResult {
         let params = req.params();
         let path = req.path();
+        let ServiceComponents {
+            search,
+            transcoding,
+            collections,
+            path_signing,
+        } = subservices;
         match *req.method() {
             Method::GET => {
                 if path.starts_with("/collections") {
-                    collections_list()
+                    api::collections_list(req.can_compress())
                 } else if path.starts_with("/transcodings") {
-                    transcodings_list()
+                    let user_agent = req.headers().typed_get::<UserAgent>();
+                    api::transcodings_list(
+                        user_agent.as_ref().map(|h| h.as_str()),
+                        req.can_compress(),
+                    )
                 } else if cfg!(feature = "shared-positions") && path.starts_with("/positions") {
                     // positions API
                     #[cfg(feature = "shared-positions")]
                     match extract_group(path) {
-                        PositionGroup::Group(group) => subs::all_positions(collections, group),
-                        PositionGroup::Last(group) => subs::last_position(collections, group),
+                        PositionGroup::Group(group) => match position_params(&params) {
+                            Ok(p) => {
+                                api::all_positions(collections, group, Some(p), req.can_compress())
+                                    .await
+                            }
+
+                            Err(e) => {
+                                error!("Invalid timestamp param: {}", e);
+                                response::fut(response::bad_request).await
+                            }
+                        },
+                        PositionGroup::Last(group) => {
+                            api::last_position(collections, group, req.can_compress()).await
+                        }
                         PositionGroup::Path {
                             collection,
                             group,
                             path,
                         } => {
-                            let recursive = req
-                                .params()
-                                .map(|p| p.get("rec").is_some())
-                                .unwrap_or(false);
-                            subs::folder_position(collections, group, collection, path, recursive)
+                            let recursive = req.params().exists("rec");
+                            let filter = match position_params(&params) {
+                                Ok(p) => p,
+
+                                Err(e) => {
+                                    error!("Invalid timestamp param: {}", e);
+                                    return Ok(response::bad_request());
+                                }
+                            };
+                            api::folder_position(
+                                collections,
+                                group,
+                                collection,
+                                path,
+                                recursive,
+                                Some(filter),
+                                req.can_compress(),
+                            )
+                            .await
                         }
-                        PositionGroup::Malformed => resp::fut(resp::bad_request),
+                        PositionGroup::Malformed => Ok(response::bad_request()),
                     }
                     #[cfg(not(feature = "shared-positions"))]
                     unimplemented!();
@@ -490,134 +389,150 @@ impl<C: 'static> FileSendService<C> {
                         Ok(r) => r,
                         Err(_) => {
                             error!("Invalid collection number");
-                            return resp::fut(resp::not_found);
+                            return Ok(response::not_found());
                         }
                     };
 
                     let base_dir = &get_config().base_dirs[colllection_index];
                     let ord = params
-                        .as_ref()
-                        .and_then(|p| p.get("ord").map(|l| FoldersOrdering::from_letter(l)))
+                        .get("ord")
+                        .map(|l| FoldersOrdering::from_letter(l))
                         .unwrap_or(FoldersOrdering::Alphabetical);
                     if path.starts_with("/audio/") {
-                        FileSendService::<C>::serve_audio(
-                            &req,
-                            base_dir,
-                            &path,
-                            transcoding,
-                            params,
-                        )
+                        MainService::<C>::serve_audio(&req, base_dir, path, transcoding).await
                     } else if path.starts_with("/folder/") {
-                        let group = params
-                            .as_ref()
-                            .and_then(|m| m.get("group").map(|i| i.to_string()));
-                        get_folder(
+                        let group = params.get_string("group");
+                        api::get_folder(
                             colllection_index,
-                            get_subpath(&path, "/folder/"),
+                            get_subpath(path, "/folder/"),
                             collections,
                             ord,
                             group,
+                            req.can_compress(),
                         )
+                        .await
                     } else if !get_config().disable_folder_download && path.starts_with("/download")
                     {
                         #[cfg(feature = "folder-download")]
                         {
                             let format = params
-                                .as_ref()
-                                .and_then(|p| p.get("fmt"))
+                                .get("fmt")
                                 .and_then(|f| f.parse::<types::DownloadFormat>().ok())
                                 .unwrap_or_default();
-                            subs::download_folder(
+                            let recursive = params
+                                .get("collapsed")
+                                .and_then(|_| get_config().collapse_cd_folders.as_ref())
+                                .and_then(|c| c.regex.as_ref())
+                                .and_then(|re| Regex::new(re).ok());
+                            files::download_folder(
                                 base_dir,
-                                get_subpath(&path, "/download/"),
+                                get_subpath(path, "/download/"),
                                 format,
+                                recursive,
                             )
+                            .await
                         }
                         #[cfg(not(feature = "folder-download"))]
                         {
                             error!("folder download not ");
-                            resp::fut(resp::not_found)
+                            Ok(response::not_found())
                         }
                     } else if path == "/search" {
-                        if let Some(search_string) = params.and_then(|mut p| p.remove("q")) {
-                            search(colllection_index, searcher, search_string.into_owned(), ord)
+                        if let Some(search_string) = params.get_string("q") {
+                            let group = params.get_string("group");
+                            api::search(
+                                colllection_index,
+                                search,
+                                search_string,
+                                ord,
+                                group,
+                                req.can_compress(),
+                            )
+                            .await
                         } else {
                             error!("q parameter is missing in search");
-                            resp::fut(resp::not_found)
+                            Ok(response::bad_request())
                         }
                     } else if path.starts_with("/recent") {
-                        recent(colllection_index, searcher)
+                        let group = params.get_string("group");
+                        api::recent(colllection_index, search, group, req.can_compress()).await
                     } else if path.starts_with("/cover/") {
-                        send_file_simple(
+                        files::send_cover(
                             base_dir,
-                            get_subpath(&path, "/cover"),
-                            Some(FOLDER_INFO_FILES_CACHE_AGE),
+                            get_subpath(path, "/cover"),
+                            get_config().folder_file_cache_age,
                         )
+                        .await
+                    } else if path.starts_with("/icon/") {
+                        files::send_folder_icon(
+                            colllection_index,
+                            get_subpath(path, "/icon/"),
+                            collections,
+                        )
+                        .await
                     } else if path.starts_with("/desc/") {
-                        send_file_simple(
+                        files::send_description(
                             base_dir,
-                            get_subpath(&path, "/desc"),
-                            Some(FOLDER_INFO_FILES_CACHE_AGE),
+                            get_subpath(path, "/desc"),
+                            get_config().folder_file_cache_age,
+                            req.can_compress(),
                         )
+                        .await
                     } else {
                         error!("Invalid path requested {}", path);
-                        resp::fut(resp::not_found)
+                        Ok(response::not_found())
                     }
                 }
             }
 
             Method::POST => {
-                #[cfg(feature = "shared-positions")]
                 if path.starts_with("/positions") {
+                    #[cfg(feature = "shared-positions")]
                     match extract_group(path) {
                         PositionGroup::Group(group) => {
-                            if req
-                                .headers()
-                                .get("Content-Type")
-                                .and_then(|v| {
-                                    v.to_str()
-                                        .ok()
-                                        .map(|s| s.to_lowercase().eq("application/json"))
-                                })
-                                .unwrap_or(false)
-                            {
-                                Box::pin(async move {
-                                    match req.body_bytes().await {
-                                        Ok(bytes) => {
-                                            subs::insert_position(collections, group, bytes).await
-                                        }
-                                        Err(e) => {
-                                            error!("Error reading POST body: {}", e);
-                                            Ok(resp::bad_request())
-                                        }
-                                    }
-                                })
-                            } else {
-                                error!("Not JSON content type");
-                                resp::fut(resp::bad_request)
+                            use crate::services::api::json_body;
+
+                            match json_body(&mut req).await {
+                                Ok(bytes) => api::insert_position(collections, group, bytes).await,
+                                Err(e) => {
+                                    error!("Error reading POST body: {}", e);
+                                    Ok(response::bad_request())
+                                }
                             }
                         }
-                        _ => resp::fut(resp::bad_request),
+                        _ => Ok(response::bad_request()),
+                    }
+                    #[cfg(not(feature = "shared-positions"))]
+                    Ok(response::not_found())
+                } else if path == "/sign-path" {
+                    match json_body(&mut req)
+                        .await
+                        .and_then(|body| sign_path(body, &path_signing))
+                    {
+                        Ok(resp) => Ok(resp),
+                        Err(e) => {
+                            error!("Error reading request body: {}", e);
+                            Ok(response::bad_request())
+                        }
                     }
                 } else {
-                    resp::fut(resp::not_found)
+                    Ok(response::not_found())
                 }
-
-                #[cfg(not(feature = "shared-positions"))]
-                resp::fut(resp::method_not_supported)
             }
 
-            _ => resp::fut(resp::method_not_supported),
+            _ => Ok(response::method_not_supported()),
         }
     }
 
-    fn serve_audio(
+    async fn serve_audio(
         req: &RequestWrapper,
         base_dir: &'static Path,
         path: &str,
         transcoding: TranscodingDetails,
-        mut params: Option<HashMap<std::borrow::Cow<str>, std::borrow::Cow<str>>>,
-    ) -> ResponseFuture {
+    ) -> ResponseResult {
+        let params = req.params();
+        let user_agent = req.headers().typed_get::<UserAgent>();
+        let user_agent = user_agent.as_ref().map(|ua| ua.as_str());
         debug!(
             "Received request with following headers {:?}",
             req.headers()
@@ -625,14 +540,14 @@ impl<C: 'static> FileSendService<C> {
 
         let range = req.headers().typed_get::<Range>();
 
-        let bytes_range = match range.map(|r| r.iter().collect::<Vec<_>>()) {
+        let bytes_range = match range.map(|r| r.satisfiable_ranges(u64::MAX).collect::<Vec<_>>()) {
             Some(bytes_ranges) => {
                 if bytes_ranges.is_empty() {
                     error!("Range header without range bytes");
-                    return resp::fut(resp::bad_request);
+                    return Ok(response::bad_request());
                 } else if bytes_ranges.len() > 1 {
                     error!("Range with multiple ranges is not supported");
-                    return resp::fut(resp::not_implemented);
+                    return Ok(response::not_implemented());
                 } else {
                     Some(bytes_ranges[0])
                 }
@@ -640,22 +555,21 @@ impl<C: 'static> FileSendService<C> {
 
             None => None,
         };
-        let seek: Option<f32> = params
-            .as_mut()
-            .and_then(|p| p.remove("seek"))
-            .and_then(|s| s.parse().ok());
-        let transcoding_quality: Option<QualityLevel> = params
-            .and_then(|mut p| p.remove("trans"))
-            .and_then(|t| QualityLevel::from_letter(&t));
+        let seek: Option<f32> = params.get("seek").and_then(|s| s.parse().ok());
+        let transcoding_quality: Option<ChosenTranscoding> = params
+            .get("trans")
+            .and_then(|t| QualityLevel::from_letter(&t))
+            .map(|level| ChosenTranscoding::for_level_and_user_agent(level, user_agent));
 
-        send_file(
+        files::send_file(
             base_dir,
-            get_subpath(&path, "/audio/"),
+            get_subpath(path, "/audio/"),
             bytes_range,
             seek,
             transcoding,
             transcoding_quality,
         )
+        .await
     }
 }
 
@@ -664,7 +578,7 @@ lazy_static! {
 }
 
 fn extract_collection_number(path: &str) -> Result<(&str, usize), ()> {
-    let matches = COLLECTION_NUMBER_RE.captures(&path);
+    let matches = COLLECTION_NUMBER_RE.captures(path);
     if let Some(matches) = matches {
         let cnum = matches.get(1).unwrap();
         // match gives us char position it's safe to slice
@@ -694,6 +608,34 @@ enum PositionGroup {
 }
 
 #[cfg(feature = "shared-positions")]
+fn position_params(params: &QueryParams) -> error::Result<collection::PositionFilter> {
+    use collection::{audio_meta::TimeStamp, PositionFilter};
+
+    fn get_ts_param(params: &QueryParams, name: &str) -> Result<Option<TimeStamp>, anyhow::Error> {
+        Ok(if let Some(ts) = params.get(name) {
+            Some(TimeStamp::from(
+                ts.parse::<u64>().map_err(error::Error::new)?,
+            ))
+        } else {
+            None
+        })
+    }
+
+    let finished = params.exists("finished");
+    let unfinished = params.exists("unfinished");
+    let finished = match (finished, unfinished) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    };
+
+    let from = get_ts_param(params, "from")?;
+    let to = get_ts_param(params, "to")?;
+
+    Ok(PositionFilter::new(finished, from, to))
+}
+
+#[cfg(feature = "shared-positions")]
 fn extract_group(path: &str) -> PositionGroup {
     let mut segments = path.splitn(5, '/');
     segments.next(); // read out first empty segment
@@ -720,10 +662,47 @@ fn extract_group(path: &str) -> PositionGroup {
 }
 
 #[cfg(test)]
-#[cfg(feature = "shared-positions")]
 mod tests {
     use super::*;
+    use crate::config::init::init_default_config;
 
+    #[test]
+    fn test_is_static_file() {
+        assert!(is_static_file("/bundle.js"));
+        assert!(is_static_file("/bundle.css"));
+        assert!(is_static_file("/global.css"));
+        assert!(is_static_file("/favicon.png"));
+        assert!(is_static_file("/app.webmanifest"));
+        assert!(is_static_file("/service-worker.js"));
+        assert!(is_static_file("/static/image.png"));
+        assert!(is_static_file("/static/sub/dir/file.js"));
+
+        assert!(!is_static_file("/api/folder"));
+        assert!(!is_static_file("/collections"));
+        assert!(!is_static_file("/1/path"));
+        assert!(!is_static_file("/bundle.jsx"));
+    }
+
+    #[test]
+    fn test_extract_collection_number() {
+        // init gives 2 collections (both pointing to temp_dir)
+        init_default_config();
+        let (path, cnum) = extract_collection_number("/0/some/path").unwrap();
+        assert_eq!(path, "/some/path");
+        assert_eq!(cnum, 0);
+        let (path, cnum) = extract_collection_number("/1/other/nested").unwrap();
+        assert_eq!(path, "/other/nested");
+        assert_eq!(cnum, 1);
+        // index 2 is out of range (only 0 and 1 exist)
+        assert!(extract_collection_number("/2/path").is_err());
+        assert!(extract_collection_number("/99/path").is_err());
+        // paths without a leading digit segment default to collection 0
+        let (path, cnum) = extract_collection_number("/no/collection/prefix").unwrap();
+        assert_eq!(path, "/no/collection/prefix");
+        assert_eq!(cnum, 0);
+    }
+
+    #[cfg(feature = "shared-positions")]
     #[test]
     fn test_extract_group() {
         if let PositionGroup::Group(x) = extract_group("/positions/usak") {
@@ -755,5 +734,32 @@ mod tests {
         } else {
             panic!("should be invalid")
         }
+    }
+
+    #[cfg(feature = "shared-positions")]
+    #[test]
+    fn test_position_params() {
+        use bytes::Bytes;
+        use http_body_util::Full;
+        use myhy::request::GenericRequestWrapper;
+        use myhy::Request;
+
+        macro_rules! params_for {
+            ($query:expr) => {{
+                let req = Request::builder()
+                    .uri(concat!("/test?", $query))
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+                let wrapper = GenericRequestWrapper::new(req).unwrap();
+                let params = wrapper.params();
+                position_params(&params)
+            }};
+        }
+
+        assert!(params_for!("finished=true").is_ok());
+        assert!(params_for!("unfinished=true").is_ok());
+        assert!(params_for!("from=1000&to=5000").is_ok());
+        assert!(params_for!("").is_ok());
+        assert!(params_for!("from=notanumber").is_err());
     }
 }

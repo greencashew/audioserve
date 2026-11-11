@@ -16,16 +16,18 @@ mod date;
 pub mod error;
 mod zip;
 pub struct Zipper<P> {
-    files: Box<dyn Iterator<Item = P> + Send>,
+    files: Box<dyn Iterator<Item = (P, String)> + Send>,
 }
 
 impl<P> Zipper<P>
 where
     P: AsRef<Path> + Send + Sync + 'static,
 {
+    #[allow(clippy::should_implement_trait)]
+    // need iter to be Send+'static so cannot use trait
     pub fn from_iter<I>(files: I) -> Self
     where
-        I: Iterator<Item = P> + Send + 'static,
+        I: Iterator<Item = (P, String)> + Send + 'static,
     {
         Zipper {
             files: Box::new(files),
@@ -33,7 +35,7 @@ where
     }
 
     async fn main_loop(
-        files: Box<dyn Iterator<Item = P> + Send>,
+        files: Box<dyn Iterator<Item = (P, String)> + Send>,
         mut sender: Sender<std::result::Result<Vec<u8>, io::Error>>,
     ) -> Result<()> {
         let mut pos: u64 = 0;
@@ -46,11 +48,12 @@ where
             }};
         }
 
-        for path in files {
+        for (path, name) in files {
             let mut f = fs::File::open(&path).await?;
             let meta = f.metadata().await?;
             // send header
-            let file_header = FileHeader::new(path, meta.modified()?)?;
+            let file_header = FileHeader::new_from_name(name, meta.modified()?);
+
             let file_header_bytes = file_header.to_bytes()?;
             let file_header_offset = pos;
             send!(file_header_bytes);
@@ -105,7 +108,10 @@ impl Zipper<PathBuf> {
         let mut dir_listing = fs::read_dir(path).await?;
         while let Some(entry) = dir_listing.next_entry().await? {
             if entry.file_type().await?.is_file() {
-                files.push(entry.path())
+                files.push((
+                    entry.path(),
+                    entry.file_name().to_string_lossy().into_owned(),
+                ))
             }
         }
 
@@ -121,7 +127,7 @@ mod tests {
     use futures::StreamExt;
     use std::{
         fs,
-        io::{Cursor, Read, Seek, Write},
+        io::{self, Cursor, Read, Seek, Write},
         path::{Path, PathBuf},
     };
     use tokio::io::AsyncReadExt;
@@ -152,6 +158,28 @@ mod tests {
             assert_eq!(tc, content);
         }
     }
+
+    #[tokio::test]
+    async fn test_io_error() {
+        let res = Zipper::from_directory("_non_existing_").await;
+        assert!(res.is_err());
+        assert!(unsafe { res.unwrap_err_unchecked() }.kind() == io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_files() {
+        let invalid = "_non_existing_";
+        let v = vec![(PathBuf::from(invalid), invalid.to_string())];
+        let mut stream = Zipper::from_iter(v.into_iter()).zipped_stream();
+        let mut mum_errors = 0;
+        while let Some(res) = stream.next().await {
+            assert!(res.is_err());
+            assert!(unsafe { res.unwrap_err_unchecked() }.kind() == io::ErrorKind::NotFound);
+            mum_errors += 1;
+        }
+        assert_eq!(mum_errors, 1);
+    }
+
     #[tokio::test]
     async fn test_zip_stream() -> Result<()> {
         let dir = PathBuf::from("src");
@@ -178,7 +206,11 @@ mod tests {
             .filter_map(|e| {
                 e.ok().and_then(|e| {
                     if e.file_type().unwrap().is_file() {
-                        Some((e.path(), e.metadata().unwrap().len()))
+                        Some((
+                            e.path(),
+                            e.file_name().to_str().map(|n| n.to_string()).unwrap(),
+                            e.metadata().unwrap().len(),
+                        ))
                     } else {
                         None
                     }
@@ -186,8 +218,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(files.len(), 4);
-        let expected_size = calc_size(files.iter().map(|&(ref p, s)| (p, s)))?;
-        let zipper = Zipper::from_iter(files.into_iter().map(|(p, _)| p));
+        let expected_size = calc_size(files.iter().map(|&(ref p, ref n, s)| (p, n.as_str(), s)))?;
+        let zipper = Zipper::from_iter(files.into_iter().map(|(p, n, _)| (p, n)));
         let mut stream = zipper.zipped_stream();
         let mut f = Cursor::new(Vec::<u8>::new());
         while let Some(chunk) = stream.next().await {

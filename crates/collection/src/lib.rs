@@ -1,63 +1,91 @@
 #[macro_use]
 extern crate log;
 
-use audio_folder::{FolderLister, FoldersOptions};
+pub use audio_folder::{list_dir_files_only, list_dir_files_with_subdirs, parse_chapter_path};
+pub use audio_meta::{
+    extract_cover, extract_description, init_media_lib, AudioFile, AudioFolderShort,
+    FoldersOrdering, TimeSpan,
+};
 use audio_meta::{AudioFolder, TimeStamp};
 use cache::CollectionCache;
-use common::{Collection, CollectionOptions, CollectionTrait, PositionsTrait};
+use common::{Collection, CollectionTrait, PositionsTrait};
+pub use common::{CollectionOptions, CollectionOptionsMap};
 use error::{Error, Result};
 use legacy_pos::LegacyPositions;
+pub use media_info::tags;
 use no_cache::CollectionDirect;
+pub use position::{Position, PositionFilter};
 use serde_json::{Map, Value};
 #[cfg(feature = "async")]
 use std::sync::Arc;
 use std::{
     collections::HashMap,
-    fs::File,
+    fs::{File, Metadata, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
     thread::JoinHandle,
 };
-use util::is_no_cache_collection;
-
-pub use audio_folder::{list_dir_files_only, parse_chapter_path};
-pub use audio_meta::{init_media_lib, AudioFile, AudioFolderShort, FoldersOrdering, TimeSpan};
-pub use media_info::tags;
-pub use position::Position;
 pub use util::guess_mime_type;
 
-use crate::{common::PositionsData, position::PositionItem};
+use crate::{
+    common::PositionsData,
+    position::{PositionItem, PositionsCollector},
+};
 
 pub mod audio_folder;
 pub mod audio_meta;
-mod cache;
+pub mod cache;
+pub(crate) mod collator;
 pub mod common;
 pub mod error;
 mod legacy_pos;
 pub(crate) mod no_cache;
+pub(crate) mod playlist;
 pub mod position;
 pub mod util;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const MAX_POSITIONS: usize = 1_000;
+pub use common::MINIMUM_CHAPTER_DURATION;
+
+fn serialize<T>(data: &T) -> Result<Vec<u8>>
+where
+    T: serde::Serialize,
+{
+    let res = bincode::serde::encode_to_vec(data, bincode::config::legacy())?;
+    Ok(res)
+}
+
+fn deserialize<T>(data: &[u8]) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let res = bincode::serde::decode_from_slice(data, bincode::config::legacy())?;
+    Ok(res.0)
+}
 
 fn check_version<P: AsRef<Path>>(db_dir: P) -> Result<()> {
     let db_dir = db_dir.as_ref();
     let version_file = db_dir.join(".version");
     if version_file.exists() {
         let mut col_db_version = String::new();
-        File::open(version_file)?.read_to_string(&mut col_db_version)?;
+        File::open(&version_file)?.read_to_string(&mut col_db_version)?;
         if col_db_version != VERSION {
             warn!(
                 "Your collection cache {:?} is version {}, which is different from current {}, \
-            if experiencing problems delete it and restore positions from backup",
-                db_dir, col_db_version, VERSION
+            if experiencing problems force full reload, in worst case delete it and restore positions from backup. \
+            You can delete {:?}, if everything is OK, and warning will disapear till next version change",
+                db_dir, col_db_version, VERSION, version_file
             );
         }
     } else {
         if !db_dir.exists() {
             std::fs::create_dir_all(db_dir)?
         }
-        let mut f = File::create(version_file)?;
+        let mut f = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(version_file)?;
         f.write_all(VERSION.as_bytes())?;
     }
 
@@ -71,9 +99,8 @@ pub struct Collections {
 impl Collections {
     pub fn new_with_detail<I, P1, P2>(
         collections_dirs: Vec<PathBuf>,
-        collections_options: HashMap<PathBuf, CollectionOptions>,
+        mut collections_options: CollectionOptionsMap,
         db_path: P2,
-        opt: FoldersOptions,
     ) -> Result<Self>
     where
         I: IntoIterator<Item = P1>,
@@ -82,32 +109,17 @@ impl Collections {
     {
         check_version(&db_path)?;
         let db_path = db_path.as_ref();
-        let allow_symlinks = opt.allow_symlinks;
-        let force_update = opt.force_cache_update_on_init;
-        let lister = FolderLister::new_with_options(opt);
         let caches = collections_dirs
             .into_iter()
             .map(move |collection_path| {
-                if is_no_cache_collection(&collections_options, &collection_path) {
+                let opt = collections_options.get_col_options(&collection_path);
+                if opt.no_cache {
                     info!("Collection {:?} is not using cache", collection_path);
-                    Ok(CollectionDirect::new(
-                        collection_path.clone(),
-                        lister.clone(),
-                        allow_symlinks,
-                    )
-                    .into())
+                    Ok(CollectionDirect::new(collection_path, opt).into())
                 } else {
-                    CollectionCache::new(
-                        collection_path.clone(),
-                        db_path,
-                        lister.clone(),
-                        force_update,
-                    )
-                    .map(|mut cache| {
-                        cache.run_update_loop();
-                        cache
-                    })
-                    .map(|c| Collection::from(c))
+                    CollectionCache::new(collection_path, db_path, opt)
+                        .map(|cache| cache.init())
+                        .map(Collection::from)
                 }
             })
             .collect::<Result<Vec<_>>>()?;
@@ -119,7 +131,7 @@ impl Collections {
     fn get_cache(&self, collection: usize) -> Result<&Collection> {
         self.caches
             .get(collection)
-            .ok_or_else(|| Error::MissingCollectionCache(collection))
+            .ok_or(Error::MissingCollectionCache(collection))
     }
 
     pub fn list_dir<P: AsRef<Path>>(
@@ -131,6 +143,25 @@ impl Collections {
     ) -> Result<AudioFolder> {
         self.get_cache(collection)?
             .list_dir(dir_path, ordering, group)
+    }
+
+    pub fn get_folder_cover_path(
+        &self,
+        collection: usize,
+        dir_path: impl AsRef<Path>,
+    ) -> Result<Option<(PathBuf, Metadata)>> {
+        let col = self.get_cache(collection)?;
+        col.get_folder_cover_path(dir_path).and_then(|p| {
+            p.map(|p| {
+                let path = col.base_dir().join(p);
+                match path.metadata() {
+                    Ok(meta) => Ok((path, meta)),
+                    Err(e) => Err(e),
+                }
+            })
+            .transpose()
+            .map_err(Error::from)
+        })
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -146,15 +177,22 @@ impl Collections {
         collection: usize,
         q: S,
         ordering: FoldersOrdering,
+        group: Option<String>,
     ) -> Result<Vec<AudioFolderShort>> {
-        let mut res = self.get_cache(collection)?.search(q);
+        let mut res = self.get_cache(collection)?.search(q, group);
 
         res.sort_unstable_by(|a, b| a.compare_as(ordering, b));
         Ok(res)
     }
 
-    pub fn recent(&self, collection: usize, limit: usize) -> Result<Vec<AudioFolderShort>> {
-        self.get_cache(collection).map(|cache| cache.recent(limit))
+    pub fn recent(
+        &self,
+        collection: usize,
+        limit: usize,
+        group: Option<String>,
+    ) -> Result<Vec<AudioFolderShort>> {
+        self.get_cache(collection)
+            .map(|cache| cache.recent(limit, group))
     }
 }
 
@@ -237,7 +275,7 @@ impl Collections {
         res
     }
 
-    pub fn force_rescan(self: Arc<Self>) {
+    pub fn force_rescan(self: std::sync::Arc<Self>) {
         self.caches.iter().for_each(|c| c.signal_rescan())
     }
 
@@ -249,13 +287,13 @@ impl Collections {
             write!(
                 f,
                 "\"{}\":",
-                c.base_dir().to_str().ok_or_else(|| Error::InvalidPath)?
+                c.base_dir().to_str().ok_or(Error::InvalidPath)?
             )?;
             c.write_json_positions(&mut f)?;
             if idx < self.caches.len() - 1 {
-                write!(f, ",\n")?;
+                writeln!(f, ",")?;
             } else {
-                write!(f, "\n")?;
+                writeln!(f)?;
             }
         }
         write!(f, "}}")?;
@@ -264,9 +302,8 @@ impl Collections {
 
     pub fn restore_positions<P2, P3>(
         collections_dirs: Vec<PathBuf>,
-        collections_options: HashMap<PathBuf, CollectionOptions>,
+        collections_options: CollectionOptionsMap,
         db_path: P2,
-        opt: FoldersOptions,
         backup_file: BackupFile<P3>,
     ) -> Result<()>
     where
@@ -274,24 +311,17 @@ impl Collections {
         P3: AsRef<Path>,
     {
         check_version(&db_path)?;
-        let force_update = opt.force_cache_update_on_init;
-        let lister = FolderLister::new_with_options(opt);
-
         let threads = match backup_file {
             BackupFile::V1(backup_file) => Collections::restore_positions_v1(
                 collections_dirs,
                 collections_options,
                 db_path,
-                lister,
-                force_update,
                 backup_file,
             ),
             BackupFile::Legacy(backup_file) => Collections::restore_positions_legacy(
                 collections_dirs,
                 collections_options,
                 db_path,
-                lister,
-                force_update,
                 backup_file,
             ),
         }?;
@@ -307,10 +337,8 @@ impl Collections {
 
     fn restore_positions_v1<P2, P3>(
         collections_dirs: Vec<PathBuf>,
-        collections_options: HashMap<PathBuf, CollectionOptions>,
+        mut collections_options: CollectionOptionsMap,
         db_path: P2,
-        lister: FolderLister,
-        force_update: bool,
         backup_file: P3,
     ) -> Result<Vec<JoinHandle<()>>>
     where
@@ -324,7 +352,8 @@ impl Collections {
         let threads = collections_dirs
             .into_iter()
             .filter_map(move |collection_path| {
-                if !is_no_cache_collection(&collections_options, &collection_path) {
+                let opt = collections_options.get_col_options(&collection_path);
+                if !opt.no_cache {
                     collection_path
                         .to_str()
                         .and_then(|path| data.remove(path))
@@ -333,8 +362,7 @@ impl Collections {
                                 CollectionCache::restore_positions(
                                     collection_path.clone(),
                                     db_path,
-                                    lister.clone(),
-                                    force_update,
+                                    opt,
                                     PositionsData::V1(v),
                                 )
                                 .map_err(|e| {
@@ -356,10 +384,8 @@ impl Collections {
 
     fn restore_positions_legacy<P2, P3>(
         collections_dirs: Vec<PathBuf>,
-        collections_options: HashMap<PathBuf, CollectionOptions>,
+        mut collections_options: CollectionOptionsMap,
         db_path: P2,
-        lister: FolderLister,
-        force_update: bool,
         backup_file: P3,
     ) -> Result<Vec<JoinHandle<()>>>
     where
@@ -378,9 +404,7 @@ impl Collections {
                 continue;
             }
             for (col_path, pos) in m.into_iter() {
-                let (col_no, path) = col_path
-                    .split_once('/')
-                    .unwrap_or_else(|| (col_path.as_str(), ""));
+                let (col_no, path) = col_path.split_once('/').unwrap_or((col_path.as_str(), ""));
 
                 let col_no: usize = col_no.parse().map_err(|_| {
                     Error::JsonDataError(format!(
@@ -415,7 +439,8 @@ impl Collections {
             .into_iter()
             .enumerate()
             .filter_map(move |(col_no, collection_path)| {
-                if !is_no_cache_collection(&collections_options, &collection_path) {
+                let opt = collections_options.get_col_options(&collection_path);
+                if !opt.no_cache {
                     col_positions.remove(&col_no).and_then(|v| {
                         // HACK: This is just dirty trick to get same structure as for current positions JSON
                         //    but I hope it did not mind, because it's just migration function to be used once
@@ -427,8 +452,7 @@ impl Collections {
                         CollectionCache::restore_positions(
                             collection_path.clone(),
                             db_path,
-                            lister.clone(),
-                            force_update,
+                            opt,
                             PositionsData::V1(json),
                         )
                         .map_err(|e| error!("Failed to restore positions from backup: {}", e))
@@ -486,27 +510,39 @@ impl Collections {
         .unwrap_or_else(|e| Err(Error::from(e)))
     }
 
-    pub async fn insert_position_if_newer_async<S, P>(
+    pub async fn insert_position_if_newer_async<S>(
         self: Arc<Self>,
-        collection: usize,
         group: S,
-        path: P,
-        position: f32,
-        folder_finished: bool,
-        ts: TimeStamp,
+        position: Position,
     ) -> Result<()>
     where
         S: AsRef<str> + Send + 'static,
-        P: AsRef<str> + Send + 'static,
     {
+        let Position {
+            position,
+            timestamp,
+            folder_finished,
+            file,
+            folder,
+            collection,
+            ..
+        } = position;
+        let file_is_empty = file.is_empty();
+        let path = if file_is_empty {
+            folder
+        } else if !folder.is_empty() {
+            folder + "/" + &file
+        } else {
+            file
+        };
         spawn_blocking!({
-            self.get_cache(collection)?.insert_position(
-                group,
-                path,
-                position,
-                folder_finished,
-                Some(ts),
-            )
+            let col = self.get_cache(collection)?;
+            if folder_finished && file_is_empty {
+                debug!("Marked {path} as finished for group {}", group.as_ref());
+                col.mark_as_finished(&group, &path, Some(timestamp))
+            } else {
+                col.insert_position(group, path, position, folder_finished, Some(timestamp))
+            }
         })
         .unwrap_or_else(|e| Err(Error::from(e)))
     }
@@ -516,17 +552,24 @@ impl Collections {
         collection: usize,
         group: S,
         folder: P,
+        filter: Option<PositionFilter>,
     ) -> Vec<Position>
     where
         S: AsRef<str> + Send + 'static,
         P: AsRef<str> + Send + 'static,
     {
         spawn_blocking!({
-            self.get_cache(collection)
+            let mut res = PositionsCollector::with_optional_filter(
+                MAX_POSITIONS,
+                filter.and_then(|f| f.into_option()),
+            );
+            if let Ok(c) = self
+                .get_cache(collection)
                 .map_err(|e| error!("Invalid collection used in get_position: {}", e))
-                .ok()
-                .map(|c| c.get_positions_recursive(group, folder, collection))
-                .unwrap_or_else(|| vec![])
+            {
+                c.get_positions_recursive(group, folder, collection, &mut res)
+            };
+            res.into_vec()
         })
         .unwrap_or_else(|e| {
             error!("Task join error: {}", e);
@@ -561,18 +604,23 @@ impl Collections {
         })
     }
 
-    pub async fn get_all_positions_for_group_async<S>(self: Arc<Self>, group: S) -> Vec<Position>
+    pub async fn get_all_positions_for_group_async<S>(
+        self: Arc<Self>,
+        group: S,
+        filter: Option<PositionFilter>,
+    ) -> Vec<Position>
     where
         S: AsRef<str> + Send + Clone + 'static,
     {
         spawn_blocking!({
-            let mut res = vec![];
+            let mut res = PositionsCollector::with_optional_filter(
+                MAX_POSITIONS,
+                filter.and_then(|f| f.into_option()),
+            );
             for (cn, c) in self.caches.iter().enumerate() {
-                let pos = c.get_all_positions_for_group(group.clone(), cn);
-                res.extend(pos);
+                c.get_all_positions_for_group(group.clone(), cn, &mut res);
             }
-            res.sort_unstable_by(|a, b| b.timestamp.cmp(&a.timestamp));
-            res
+            res.into_vec()
         })
         .unwrap_or_else(|e| {
             error!("Task join error: {}", e);
@@ -617,5 +665,66 @@ impl Collections {
     {
         spawn_blocking!({ self.backup_positions(backup_file) })
             .unwrap_or_else(|e| Err(Error::from(e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio_meta::TimeStamp;
+    use crate::position::{PositionItem, PositionRecord};
+
+    fn make_test_record() -> PositionRecord {
+        let mut rec = PositionRecord::new();
+        rec.insert(
+            "folder/track.mp3".into(),
+            PositionItem {
+                file: "track.mp3".into(),
+                timestamp: TimeStamp::from(1_700_000_000_000u64),
+                position: 42.5_f32,
+                folder_finished: false,
+            },
+        );
+        rec
+    }
+
+    #[test]
+    fn test_position_record_roundtrip() {
+        let original = make_test_record();
+        let bytes = serialize(&original).expect("serialize failed");
+        let decoded: PositionRecord = deserialize(&bytes).expect("deserialize failed");
+        let item = decoded.get("folder/track.mp3").unwrap();
+        assert_eq!(item.file, "track.mp3");
+        assert!((item.position - 42.5_f32).abs() < 1e-4);
+        assert!(!item.folder_finished);
+    }
+
+    #[test]
+    fn test_position_record_golden_bytes() {
+        // Pins the exact bincode encoding (legacy config).
+        // If bincode is updated and this test fails, verify the new encoding
+        // is backward-compatible with existing on-disk sled data before updating.
+        let mut rec = PositionRecord::new();
+        rec.insert(
+            "f".into(),
+            PositionItem {
+                file: "a".into(),
+                timestamp: TimeStamp::from(0u64),
+                position: 0.0_f32,
+                folder_finished: false,
+            },
+        );
+        let bytes = serialize(&rec).expect("serialize failed");
+        // Generated with bincode 2.0.1 / legacy config.
+        // To update: run `cargo test -p collection test_position_record_golden_bytes -- --nocapture`,
+        // copy the printed bytes, then verify backward-compatibility before committing.
+        let expected: &[u8] = &[
+            1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 102, 1, 0, 0, 0, 0, 0, 0, 0, 97, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(
+            bytes, expected,
+            "bincode encoding changed — verify backward-compatibility before updating golden bytes"
+        );
     }
 }

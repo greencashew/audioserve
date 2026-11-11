@@ -13,12 +13,6 @@ url_path_prefix: /user/audioserve
 transcoding:
   max_parallel_processes: 8
   max_runtime_hours: 24
-  cache:
-    root_dir: test_data/audioserve-cache
-    max_size: 1024
-    max_files: 1024
-    disabled: false
-    save_often: false
   low:
     opus-in-ogg:
       bitrate: 32
@@ -40,14 +34,13 @@ transcoding:
 token_validity_hours: 8760
 secret_file: test_data/.audioserve.secret
 client_dir: test_data
-cors: true
+cors: {}
 ssl:
   key_file: test_data/desc.txt
-  key_password: neco
+  cert_file: test_data/desc.txt
 allow_symlinks: true
 search_cache: true
 disable_folder_download: false
 chapters:
   from_duration: 30
   duration: 30
-positions_file: test_data/.audioserve-positions

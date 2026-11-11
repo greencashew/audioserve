@@ -45,6 +45,7 @@ struct DirEntryTimed {
 
 // need reverse ordering for heap, oldest will be on top
 use std::cmp::Ordering;
+#[allow(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd for DirEntryTimed {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(match self.created.cmp(&other.created) {
@@ -56,7 +57,7 @@ impl PartialOrd for DirEntryTimed {
 }
 impl Ord for DirEntryTimed {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(&other).unwrap()
+        self.partial_cmp(other).unwrap()
     }
 }
 
@@ -64,7 +65,8 @@ pub type DirRef<'a> = NodeRef<'a, DirEntry>;
 
 pub struct SearchItem<'a>(DirRef<'a>);
 
-impl<'a> SearchItem<'a> {
+impl SearchItem<'_> {
+    #[allow(clippy::needless_collect)]
     pub fn path(&self) -> PathBuf {
         let segments: Vec<_> = self
             .0
@@ -123,15 +125,11 @@ impl<'a> Iterator for SearchResult<'a> {
             } else if let Some(mut parent) = self.current_node.parent() {
                 self.matched_terms_stack.pop().unwrap();
                 trace!("Pop {:?}", self.matched_terms_stack.last().unwrap());
-                while let None = parent.next_sibling() {
-                    parent = match parent.parent() {
-                        Some(p) => {
-                            self.matched_terms_stack.pop().unwrap();
-                            trace!("Pop {:?}", self.matched_terms_stack.last().unwrap());
-                            p
-                        }
-                        None => return None,
-                    };
+                while parent.next_sibling().is_none() {
+                    let p = parent.parent()?;
+                    self.matched_terms_stack.pop().unwrap();
+                    trace!("Pop {:?}", self.matched_terms_stack.last().unwrap());
+                    parent = p;
                 }
                 // is safe to unwrap, as previous loop will either find parent with next sibling or return
                 self.current_node = parent.next_sibling().unwrap();
@@ -154,7 +152,7 @@ impl<'a> Iterator for SearchResult<'a> {
     }
 }
 
-impl<'a> SearchResult<'a> {
+impl SearchResult<'_> {
     fn has_match(&mut self) -> bool {
         let mut matched_terms = self.matched_terms_stack.last().unwrap().clone();
         let res = self
@@ -204,7 +202,7 @@ impl DirTree {
         let p: &Path = root_dir.as_ref();
         let root_name = p
             .to_str()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "root directory is not utf8"))?;
+            .ok_or_else(|| io::Error::other("root directory is not utf8"))?;
         if !p.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -271,11 +269,11 @@ impl DirTree {
         })
     }
 
-    pub fn iter(&self) -> Skip<Descendants<DirEntry>> {
+    pub fn iter(&self) -> Skip<Descendants<'_, DirEntry>> {
         self.tree.root().descendants().skip(1)
     }
 
-    pub fn search<S: AsRef<str>>(&self, query: S) -> SearchResult {
+    pub fn search<S: AsRef<str>>(&self, query: S) -> SearchResult<'_> {
         let search_terms = query
             .as_ref()
             .split(' ')
@@ -313,9 +311,9 @@ mod tests {
 
     #[test]
     fn test_search() {
-        fn count_matches(mut s: SearchResult) -> usize {
+        fn count_matches(s: SearchResult) -> usize {
             let mut num = 0;
-            while let Some(n) = s.next() {
+            for n in s {
                 println!("{:?}", n.path());
                 num += 1;
             }

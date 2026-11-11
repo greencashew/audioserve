@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde_derive::Deserialize;
+use serde::Deserialize;
 
 use crate::audio_meta::TimeStamp;
 
@@ -25,6 +25,7 @@ pub(super) struct LegacyPosition {
 }
 
 #[derive(Clone, Deserialize)]
+#[allow(dead_code)]
 pub(super) struct LegacyPositions {
     pub table: HashMap<String, HashMap<String, LegacyPosition>>,
     pub max_size: usize,

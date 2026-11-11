@@ -1,8 +1,9 @@
+use crate::collator::Collate;
 use crate::error::{Error, Result};
 use crate::position::PositionShort;
 use crate::util::{get_file_name, get_modified, guess_mime_type};
 use mime_guess::Mime;
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::{
     cmp::Ordering,
@@ -91,6 +92,8 @@ pub struct AudioFile {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AudioFolder {
     pub is_file: bool,
+    #[serde(default)]
+    pub is_collapsed: bool,
     pub modified: Option<TimeStamp>, // last modification time of this folder
     pub total_time: Option<u32>,     // total playback time of contained audio files
     pub files: Vec<AudioFile>,
@@ -107,6 +110,7 @@ pub struct AudioFolder {
 #[derive(Clone, Copy)]
 pub enum FoldersOrdering {
     Alphabetical,
+    Natural, // if starts by number first by this number then by rest
     RecentFirst,
 }
 
@@ -114,6 +118,7 @@ impl FoldersOrdering {
     pub fn from_letter(l: &str) -> Self {
         match l {
             "m" => FoldersOrdering::RecentFirst,
+            "n" => FoldersOrdering::Natural,
             _ => FoldersOrdering::Alphabetical,
         }
     }
@@ -153,10 +158,10 @@ pub struct AudioFolderShort {
 }
 
 impl AudioFolderShort {
-    pub fn from_path<P: AsRef<Path>>(base_path: &Path, p: P) -> Self {
+    pub fn from_path_simple<P: AsRef<Path>>(base_path: &Path, p: P) -> Self {
         let p = p.as_ref();
         AudioFolderShort {
-            name: get_file_name(&p).into(),
+            name: get_file_name(p).into(),
             path: p.strip_prefix(base_path).unwrap().into(),
             is_file: false,
             modified: None,
@@ -164,16 +169,16 @@ impl AudioFolderShort {
         }
     }
 
-    pub fn from_dir_entry(
-        f: &std::fs::DirEntry,
+    pub fn from_path_complete(
+        full_path: impl AsRef<Path>,
         path: PathBuf,
         is_file: bool,
     ) -> std::result::Result<Self, std::io::Error> {
         Ok(AudioFolderShort {
+            name: get_file_name(&path).into(),
             path,
-            name: f.file_name().to_string_lossy().into(),
             is_file,
-            modified: get_modified(f.path()).map(|t| t.into()),
+            modified: get_modified(full_path).map(|t| t.into()),
             finished: false,
         })
     }
@@ -190,7 +195,8 @@ impl AudioFolderShort {
 
     pub fn compare_as(&self, ord: FoldersOrdering, other: &Self) -> Ordering {
         match ord {
-            FoldersOrdering::Alphabetical => self.name.cmp(&other.name),
+            FoldersOrdering::Alphabetical => self.collate(other),
+            FoldersOrdering::Natural => self.collate_natural(other),
             FoldersOrdering::RecentFirst => match (self.modified, other.modified) {
                 (Some(ref a), Some(ref b)) => b.cmp(a),
                 (Some(_), None) => Ordering::Less,
@@ -201,7 +207,7 @@ impl AudioFolderShort {
     }
 }
 
-#[derive(PartialEq, Eq, Ord)]
+#[derive(PartialEq, Eq)]
 pub(crate) struct FolderByModification(AudioFolderShort);
 
 impl From<AudioFolderShort> for FolderByModification {
@@ -218,18 +224,17 @@ impl From<FolderByModification> for AudioFolderShort {
 
 impl PartialOrd for FolderByModification {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match other.0.modified.partial_cmp(&self.0.modified) {
-            Some(Ordering::Equal) => self.0.partial_cmp(&other.0),
-            other => other,
-        }
+        Some(self.cmp(other))
     }
 }
 
-pub struct Chapter {
-    pub number: u32,
-    pub title: String,
-    pub start: u64,
-    pub end: u64,
+impl Ord for FolderByModification {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match other.0.modified.cmp(&self.0.modified) {
+            Ordering::Equal => self.0.cmp(&other.0),
+            other => other,
+        }
+    }
 }
 
 fn has_subtype(mime: &Mime, subtypes: &[&str]) -> bool {
@@ -251,7 +256,7 @@ pub fn is_audio<P: AsRef<Path>>(path: P) -> bool {
     mime.type_() == "audio" && has_subtype(&mime, AUDIO)
 }
 
-const COVERS: &[&str] = &["jpeg", "png"];
+const COVERS: &[&str] = &["jpeg", "png", "webp"];
 
 pub fn is_cover<P: AsRef<Path>>(path: P) -> bool {
     let mime = guess_mime_type(path);
@@ -265,12 +270,32 @@ pub fn is_description<P: AsRef<Path>>(path: P) -> bool {
     mime.type_() == "text" && has_subtype(&mime, DESCRIPTIONS)
 }
 
+// have to propagate this type further - ideally this should be in separate crate with other types used throwout other crates
+pub use media_info::Chapter;
 /// trait to generalize access to media metadata
 /// (so that underlying library can be easily changed)
-pub trait MediaInfo<'a>: Sized {
+pub trait MediaInfo: Sized {
     fn get_audio_info(&self, required_tags: &Option<HashSet<String>>) -> Option<AudioMeta>;
     fn get_chapters(&self) -> Option<Vec<Chapter>>;
     fn has_chapters(&self) -> bool;
+    fn has_cover(&self) -> bool;
+    fn cover(&self) -> Option<Vec<u8>>;
+    fn has_description(&self) -> bool;
+    fn description(&self) -> Option<String>;
+}
+
+pub fn extract_description(file_path: impl AsRef<Path> + std::fmt::Debug) -> Option<String> {
+    get_audio_properties_uni(file_path.as_ref())
+        .map_err(|e| error!("Error {} when extracting metadata from {:?}", e, file_path))
+        .ok()
+        .and_then(|m| m.description())
+}
+
+pub fn extract_cover(file_path: impl AsRef<Path> + std::fmt::Debug) -> Option<Vec<u8>> {
+    get_audio_properties_uni(file_path.as_ref())
+        .map_err(|e| error!("Error {} when extracting metadata from {:?}", e, file_path))
+        .ok()
+        .and_then(|m| m.cover())
 }
 
 mod libavformat {
@@ -279,6 +304,8 @@ mod libavformat {
 
     static INIT_LIBAV: Once = Once::new();
 
+    const DESCRIPTION_KEYS: &[&str] = &["description", "comment"];
+
     pub fn init() {
         INIT_LIBAV.call_once(media_info::init)
     }
@@ -286,7 +313,7 @@ mod libavformat {
     pub struct Info {
         media_file: media_info::MediaFile,
     }
-    impl<'a> MediaInfo<'a> for Info {
+    impl MediaInfo for Info {
         fn get_audio_info(&self, required_tags: &Option<HashSet<String>>) -> Option<AudioMeta> {
             Some(AudioMeta {
                 duration: (self.media_file.duration() as f32 / 1000.0).round() as u32,
@@ -296,20 +323,50 @@ mod libavformat {
         }
 
         fn has_chapters(&self) -> bool {
-            self.media_file.chapters_count() > 1
+            self.get_chapters().is_some()
         }
 
         fn get_chapters(&self) -> Option<Vec<Chapter>> {
-            self.media_file.chapters().map(|l| {
-                l.into_iter()
-                    .map(|c| Chapter {
-                        number: c.num as u32,
-                        title: c.title,
-                        start: c.start,
-                        end: c.end,
-                    })
-                    .collect()
-            })
+            self.media_file
+                .chapters()
+                .map(|l| {
+                    l.into_iter()
+                        .filter(|ch| {
+                            if ch.start + 100 >= ch.end {
+                                // ignore chapters below 1000 ms
+                                warn!(
+                                    "Invalid chapter {}  too short duration {}-{}",
+                                    ch.title, ch.start, ch.end
+                                );
+                                false
+                            } else {
+                                true
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                // ignore files with only one chapter
+                .filter(|c| c.len() >= 2)
+        }
+
+        fn has_cover(&self) -> bool {
+            self.media_file.has_cover()
+        }
+
+        fn cover(&self) -> Option<Vec<u8>> {
+            self.media_file.cover()
+        }
+
+        fn has_description(&self) -> bool {
+            DESCRIPTION_KEYS
+                .iter()
+                .any(|&key| self.media_file.has_meta(key))
+        }
+
+        fn description(&self) -> Option<String> {
+            DESCRIPTION_KEYS
+                .iter()
+                .find_map(|&key| self.media_file.meta(key))
         }
     }
 
@@ -325,11 +382,21 @@ mod libavformat {
             })
         }
 
-        pub fn from_file(path: &Path) -> Result<Info> {
+        pub fn from_file(
+            path: &Path,
+            #[cfg(feature = "tags-encoding")] alternate_encoding: Option<impl AsRef<str>>,
+        ) -> Result<Info> {
             match path.as_os_str().to_str() {
-                Some(fname) => Ok(Info {
-                    media_file: media_info::MediaFile::open(fname)?,
-                }),
+                Some(fname) => {
+                    #[cfg(feature = "tags-encoding")]
+                    let media_file =
+                        media_info::MediaFile::open_with_encoding(fname, alternate_encoding)?;
+
+                    #[cfg(not(feature = "tags-encoding"))]
+                    let media_file = media_info::MediaFile::open(fname)?;
+
+                    Ok(Info { media_file })
+                }
                 None => {
                     error!("Invalid file name {:?}, not utf-8", path);
                     Err(Error::InvalidPath)
@@ -339,8 +406,25 @@ mod libavformat {
     }
 }
 
+#[cfg(not(feature = "tags-encoding"))]
 pub fn get_audio_properties(audio_file_path: &Path) -> Result<impl MediaInfo> {
     libavformat::Info::from_file(audio_file_path)
+}
+
+#[cfg(feature = "tags-encoding")]
+pub fn get_audio_properties(
+    audio_file_path: &Path,
+    alternate_encoding: Option<impl AsRef<str>>,
+) -> Result<impl MediaInfo> {
+    libavformat::Info::from_file(audio_file_path, alternate_encoding)
+}
+
+pub fn get_audio_properties_uni(audio_file_path: &Path) -> Result<impl MediaInfo> {
+    #[cfg(not(feature = "tags-encoding"))]
+    return libavformat::Info::from_file(audio_file_path);
+
+    #[cfg(feature = "tags-encoding")]
+    return libavformat::Info::from_file(audio_file_path, None::<&str>);
 }
 
 pub fn init_media_lib() {

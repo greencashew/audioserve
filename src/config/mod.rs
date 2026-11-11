@@ -1,7 +1,13 @@
+use collection::MINIMUM_CHAPTER_DURATION;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+
 pub use self::error::{Error, Result};
-use super::services::transcode::{QualityLevel, Transcoder, TranscodingFormat};
+use super::services::transcode::{QualityLevel, TranscodingFormat};
+use crate::services::transcode::codecs::{Bandwidth, Opus};
 use crate::util;
 use std::collections::{HashMap, HashSet};
+use std::convert::TryInto;
 use std::env;
 use std::fs::File;
 use std::io::Read;
@@ -17,14 +23,24 @@ mod error;
 
 static mut CONFIG: Option<Config> = None;
 
+pub const LONG_VERSION: &str = env!("AUDIOSERVE_LONG_VERSION");
+pub const FEATURES: &str = env!("AUDIOSERVE_FEATURES");
+const CD_FOLDER_RE: &str = r"^CD[ -_]?\s*\d+\s*$";
+
 // CONFIG is assured to be inited only once from main thread
 pub fn get_config() -> &'static Config {
-    unsafe { CONFIG.as_ref().expect("Config is not initialized") }
+    // It's safe as CONFIG is initialized only once in main thread before any other
+    #[allow(static_mut_refs)]
+    unsafe {
+        CONFIG.as_ref().expect("Config is not initialized")
+    }
 }
 
 static mut BASE_DATA_DIR: Option<PathBuf> = None;
 
 fn base_data_dir() -> &'static PathBuf {
+    // It's safe - same as
+    #[allow(static_mut_refs)]
     unsafe {
         BASE_DATA_DIR
             .as_ref()
@@ -32,9 +48,67 @@ fn base_data_dir() -> &'static PathBuf {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+pub struct IconsConfig {
+    pub cache_dir: PathBuf,
+    pub cache_max_size: u32,
+    pub cache_max_files: u32,
+    pub cache_disabled: bool,
+    pub size: u32,
+    pub cache_save_often: bool,
+    pub fast_scaling: bool,
+}
+
+impl Default for IconsConfig {
+    fn default() -> Self {
+        let data_base_dir = base_data_dir();
+        let cache_dir = data_base_dir.join("icons-cache");
+        IconsConfig {
+            cache_dir,
+            cache_max_size: 100,
+            cache_max_files: 1024,
+            cache_disabled: false,
+            cache_save_often: false,
+            size: 128,
+            fast_scaling: false,
+        }
+    }
+}
+
+impl IconsConfig {
+    pub fn check(&self) -> Result<()> {
+        if !util::parent_dir_exists(&self.cache_dir) {
+            return value_error!(
+                "icons.cache_root_dir",
+                "Parent directory does not exists for {:?}",
+                self.cache_dir
+            );
+        };
+
+        if self.cache_max_size < 10 {
+            return value_error!(
+                "max_size",
+                "Icons cache small then 10 MB does not make sense"
+            );
+        }
+
+        if self.cache_max_files < 100 {
+            return value_error!(
+                "max_size",
+                "Icons cache with less the 100 files does not make sense"
+            );
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(feature = "transcoding-cache")]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct TranscodingCacheConfig {
     pub root_dir: PathBuf,
     pub max_size: u32,
@@ -89,6 +163,7 @@ impl TranscodingCacheConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct TranscodingConfig {
     pub max_parallel_processes: usize,
     pub max_runtime_hours: u32,
@@ -97,56 +172,128 @@ pub struct TranscodingConfig {
     low: TranscodingFormat,
     medium: TranscodingFormat,
     high: TranscodingFormat,
+    alt_configs: Option<HashMap<String, TranscodingDetails>>,
+    #[serde(skip)]
+    alt_configs_inner: Option<Vec<(regex::Regex, TranscodingDetails)>>,
 }
 
 impl Default for TranscodingConfig {
     fn default() -> Self {
         TranscodingConfig {
-            max_parallel_processes: (2 * num_cpus::get()),
+            max_parallel_processes: (2 * num_cpus::get()).max(4),
             max_runtime_hours: 24,
             #[cfg(feature = "transcoding-cache")]
             cache: TranscodingCacheConfig::default(),
-            low: TranscodingFormat::default_level(QualityLevel::Low),
-            medium: TranscodingFormat::default_level(QualityLevel::Medium),
-            high: TranscodingFormat::default_level(QualityLevel::High),
+            low: TranscodingFormat::OpusInOgg(Opus::new(32, 5, Bandwidth::SuperWideBand, true)),
+            medium: TranscodingFormat::OpusInOgg(Opus::new(48, 8, Bandwidth::SuperWideBand, false)),
+            high: TranscodingFormat::OpusInOgg(Opus::new(64, 10, Bandwidth::FullBand, false)),
+            alt_configs: None,
+            alt_configs_inner: None,
         }
     }
 }
 
-impl TranscodingConfig {
-    pub fn get(&self, quality: QualityLevel) -> TranscodingFormat {
-        match quality {
-            QualityLevel::Low => self.low.clone(),
-            QualityLevel::Medium => self.medium.clone(),
-            QualityLevel::High => self.high.clone(),
-            QualityLevel::Passthrough => TranscodingFormat::Remux,
+macro_rules! implement_get_transcoding {
+    ($($trans_config:ty),*) => {
+        $(
+        impl $trans_config {
+            pub fn get(&self, quality: QualityLevel) -> TranscodingFormat {
+                match quality {
+                    QualityLevel::Low => self.low.clone(),
+                    QualityLevel::Medium => self.medium.clone(),
+                    QualityLevel::High => self.high.clone(),
+                    QualityLevel::Passthrough => TranscodingFormat::Remux,
+                }
+            }
         }
-    }
+        )*
 
+    };
+}
+
+impl TranscodingConfig {
     pub fn check(&self) -> Result<()> {
-        if self.max_parallel_processes < 2 {
+        if self.max_parallel_processes < 4 {
             return value_error!(
                 "max_parallel_processes",
-                "With less then 2 transcoding processes audioserve will not work properly"
+                "With less then 4 transcoding processes audioserve will not work properly"
             );
-        } else if self.max_parallel_processes > 100 {
+        } else if self.max_parallel_processes > 200 {
             return value_error!(
                 "max_parallel_processes",
-                "As transcodings are resource intesive, having more then 100 is not wise"
+                "As transcodings are resource intesive, having more then 200 is not wise"
             );
         }
 
         if self.max_runtime_hours < 1 {
             return value_error!("max_runtime_hours", "Minimum time is 1 hour");
         }
+
+        if let Some(alt_configs) = self.alt_configs.as_ref() {
+            for re in alt_configs.keys() {
+                regex::Regex::new(re)
+                    .map(|_re| ())
+                    .or_else(|e| value_error!("alt_encodings", "Invalid User Agent regex {}", e))?
+            }
+        }
         #[cfg(feature = "transcoding-cache")]
         self.cache.check()?;
         Ok(())
     }
+
+    pub fn prepare(&mut self) -> Result<()> {
+        if let Some(alt_configs) = self.alt_configs.take() {
+            if !alt_configs.is_empty() {
+                self.alt_configs_inner = Some(
+                    alt_configs
+                        .into_iter()
+                        // I can unwrap because regex we checked by check fh
+                        .map(|(re, mut cfg)| {
+                            cfg.tag = generate_tag(&re);
+                            (regex::Regex::new(&re), cfg)
+                        })
+                        .map(|(res, cfg)| match res {
+                            Ok(re) => Ok((re, cfg)),
+                            Err(e) => Err(Error::in_value(
+                                "alt_configs",
+                                format!("Invalid regex {}", e),
+                            )),
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            }
+        }
+        Ok(())
+    }
+
+    pub fn alt_configs(&self) -> Option<&Vec<(regex::Regex, TranscodingDetails)>> {
+        self.alt_configs_inner.as_ref()
+    }
 }
+
+fn generate_tag(s: &str) -> String {
+    let hash = ring::digest::digest(&ring::digest::SHA256, s.as_bytes());
+    format!(
+        "{:016x}",
+        u64::from_be_bytes(hash.as_ref()[..8].try_into().expect("Invalid size"))
+    )
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscodingDetails {
+    #[serde(skip)]
+    pub tag: String,
+    low: TranscodingFormat,
+    medium: TranscodingFormat,
+    high: TranscodingFormat,
+}
+
+implement_get_transcoding!(TranscodingConfig, TranscodingDetails);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct ThreadPoolConfig {
     pub num_threads: u16,
     pub queue_size: u16,
@@ -160,6 +307,38 @@ impl Default for ThreadPoolConfig {
             queue_size: 100,
             keep_alive: None,
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+pub struct CollectionConfig {
+    pub dont_watch_for_changes: bool,
+    pub changes_debounce_interval: u32,
+}
+
+impl Default for CollectionConfig {
+    fn default() -> Self {
+        Self {
+            dont_watch_for_changes: false,
+            changes_debounce_interval: 10,
+        }
+    }
+}
+
+impl CollectionConfig {
+    fn check(&self) -> Result<()> {
+        if self.changes_debounce_interval < 1 {
+            return value_error!("changes_debounce_interval", "Must be bigger then 0");
+        } else if self.changes_debounce_interval > 1800 {
+            return value_error!(
+                "changes_debounce_interval",
+                "Interval is too big, this cause performance problems"
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -196,6 +375,7 @@ impl ThreadPoolConfig {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct ChaptersSize {
     pub from_duration: u32,
     pub duration: u32,
@@ -212,14 +392,14 @@ impl Default for ChaptersSize {
 
 impl ChaptersSize {
     pub fn check(&self) -> Result<()> {
-        if self.from_duration > 0 && self.from_duration < 10 {
+        if self.from_duration > 0 && self.from_duration < MINIMUM_CHAPTER_DURATION {
             return value_error!(
                 "from_duration",
                 "File shorter then 10 mins should not be split to chapters"
             );
         }
 
-        if self.duration < 10 {
+        if self.duration < MINIMUM_CHAPTER_DURATION {
             return value_error!("duration", "Minimal chapter duration is 10 minutes");
         }
 
@@ -228,9 +408,10 @@ impl ChaptersSize {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SslConfig {
     pub key_file: PathBuf,
-    pub key_password: String,
+    pub cert_file: PathBuf,
 }
 
 impl SslConfig {
@@ -239,22 +420,6 @@ impl SslConfig {
             return value_error!("ssl", "SSL key file {:?} doesn't exist", self.key_file);
         }
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BaseDirOptions {
-    pub no_cache: bool,
-}
-
-impl FromStr for BaseDirOptions {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "nc" | "no-cache" => Ok(BaseDirOptions { no_cache: true }),
-            _ => return value_error!("base_dir", format!("invalid option {}", s)),
-        }
     }
 }
 
@@ -272,10 +437,7 @@ impl FromStr for PositionsBackupFormat {
         match s {
             "legacy" => Ok(PositionsBackupFormat::Legacy),
             "v1" => Ok(PositionsBackupFormat::V1),
-            _ => Err(Error::ConfigValue {
-                name: "positions-restore",
-                message: "Invalid version".into(),
-            }),
+            _ => value_error!("positions-restore", "Invalid version"),
         }
     }
 }
@@ -283,6 +445,7 @@ impl FromStr for PositionsBackupFormat {
 #[cfg(feature = "shared-positions")]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct PositionsConfig {
     pub ws_timeout: Duration,
     pub backup_file: Option<PathBuf>,
@@ -318,21 +481,57 @@ impl PositionsConfig {
     }
 }
 
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorsConfig {
+    #[serde(default)]
+    pub regex: Option<String>,
+    #[serde(skip)]
+    pub allow: Cors,
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollapseCDFolderConfig {
+    #[serde(default)]
+    pub regex: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub enum Cors {
+    #[default]
+    AllowAllOrigins,
+    AllowMatchingOrigins(Regex),
+}
+
+impl FromStr for Cors {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let re = Regex::new(s)
+            .map_err(|e| Error::in_value("cors-regex", format!("Invalid cors regex: {}", e)))?;
+        Ok(Cors::AllowMatchingOrigins(re))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen: SocketAddr,
     pub thread_pool: ThreadPoolConfig,
     pub base_dirs: Vec<PathBuf>,
-    pub base_dirs_options: HashMap<PathBuf, BaseDirOptions>,
+    pub base_dirs_options: HashMap<PathBuf, String>,
     pub url_path_prefix: Option<String>,
     pub shared_secret: Option<String>,
     pub limit_rate: Option<f32>,
+    #[serde(with = "serde_yaml::with::singleton_map_recursive")]
+    // to keep backward compatibility with existing configs
     pub transcoding: TranscodingConfig,
     pub token_validity_hours: u32,
     pub secret_file: PathBuf,
     pub client_dir: PathBuf,
-    pub cors: bool,
+    pub cors: Option<CorsConfig>,
     pub ssl: Option<SslConfig>,
     pub allow_symlinks: bool,
     pub search_cache: bool,
@@ -346,30 +545,34 @@ pub struct Config {
     pub collections_cache_dir: PathBuf,
     pub tags: HashSet<String>,
     pub force_cache_update_on_init: bool,
+    pub natural_files_ordering: bool,
+    pub static_resource_cache_age: Option<u32>,
+    pub folder_file_cache_age: Option<u32>,
+    pub collapse_cd_folders: Option<CollapseCDFolderConfig>,
+    #[cfg(feature = "tags-encoding")]
+    pub tags_encoding: Option<String>,
+    pub icons: IconsConfig,
+    pub time_to_folder_end: u32,
+    pub read_playlist: bool,
+    pub collections_options: CollectionConfig,
+    pub compress_responses: bool,
 }
 
 impl Config {
-    pub fn transcoder(&self, transcoding_quality: QualityLevel) -> Transcoder {
-        Transcoder::new(get_config().transcoding.get(transcoding_quality))
-    }
-
     pub fn add_base_dir<P: AsRef<str>>(&mut self, p: P) -> Result<()> {
         let mut parts = p.as_ref().splitn(2, ':');
         let base_dir = parts
             .next()
             .map(PathBuf::from)
-            .ok_or_else(|| Error::ConfigValue {
-                name: "base_dir",
-                message: "Empty base_dir".into(),
-            })?;
+            .ok_or_else(|| Error::in_value("base_dir", "Empty base_dir, nothing before :"))?;
 
         if !base_dir.is_dir() {
             return value_error!("base_dir", "{:?} is not direcrory", base_dir);
         }
 
         if let Some(options) = parts.next() {
-            let options: BaseDirOptions = options.parse()?;
-            self.base_dirs_options.insert(base_dir.clone(), options);
+            self.base_dirs_options
+                .insert(base_dir.clone(), options.to_string());
         }
         self.base_dirs.push(base_dir);
         Ok(())
@@ -401,13 +604,30 @@ impl Config {
             ),
         }
     }
+    /// Any runtime optimalizations, compilatipons of config
+    pub fn prepare(&mut self) -> Result<()> {
+        self.transcoding.prepare()?;
+
+        if let Some(ref mut cors) = self.cors {
+            if let Some(ref re) = cors.regex {
+                cors.allow = re.parse()?;
+            }
+        }
+
+        if let Some(ref mut collapse) = self.collapse_cd_folders {
+            if collapse.regex.is_none() {
+                collapse.regex = Some(CD_FOLDER_RE.into());
+            }
+        }
+        Ok(())
+    }
 
     pub fn check(&self) -> Result<()> {
         if self
             .shared_secret
             .as_ref()
             .map(String::len)
-            .unwrap_or(std::usize::MAX)
+            .unwrap_or(usize::MAX)
             < 3
         {
             return value_error!("shared_secret", "Shared secret must be at least 3 bytes");
@@ -436,15 +656,17 @@ impl Config {
             );
         };
 
-        if self.ssl.is_some() {
-            self.ssl.as_ref().unwrap().check()?
+        if let Some(ref ssl) = self.ssl {
+            ssl.check()?
         }
 
         self.transcoding.check()?;
+        self.icons.check()?;
         self.thread_pool.check()?;
         self.chapters.check()?;
         #[cfg(feature = "shared-positions")]
         self.positions.check()?;
+        self.collections_options.check()?;
 
         if self.base_dirs.is_empty() {
             return value_error!(
@@ -464,8 +686,15 @@ impl Config {
         }
 
         if let Some(url) = &self.url_path_prefix {
-            if let Err(e) = validators::is_valid_url_path_prefix(url.clone()) {
-                return value_error!("url_path_prefix", e);
+            if let Err(e) = validators::is_valid_url_path_prefix(url.as_str()) {
+                return value_error!("url_path_prefix", e.to_string());
+            }
+        }
+
+        if let Some(ref c) = self.collapse_cd_folders {
+            if let Some(ref re) = c.regex {
+                Regex::new(re)
+                    .or_else(|e| value_error!("cd-folder-regex", "Invalid regex: {}", e))?;
             }
         }
 
@@ -494,9 +723,12 @@ impl Default for Config {
             limit_rate: None,
             transcoding: TranscodingConfig::default(),
             token_validity_hours: 365 * 24,
+            #[cfg(test)]
+            client_dir: "test_data".into(),
+            #[cfg(not(test))]
             client_dir: "client/dist".into(),
             secret_file: data_base_dir.join("audioserve.secret"),
-            cors: false,
+            cors: None,
             ssl: None,
             allow_symlinks: false,
             search_cache: false,
@@ -508,14 +740,27 @@ impl Default for Config {
             collections_cache_dir: data_base_dir.join("col_db"),
             tags: HashSet::new(),
             force_cache_update_on_init: false,
+            natural_files_ordering: true,
             #[cfg(feature = "shared-positions")]
             positions: Default::default(),
+            static_resource_cache_age: None,
+            folder_file_cache_age: Some(24 * 3600),
+            collapse_cd_folders: None,
+            #[cfg(feature = "tags-encoding")]
+            tags_encoding: None,
+            icons: IconsConfig::default(),
+            time_to_folder_end: 10,
+            read_playlist: false,
+            collections_options: CollectionConfig::default(),
+            compress_responses: false,
         }
     }
 }
 
 pub fn init_config() -> Result<()> {
     unsafe {
+        // It's safe as CONFIG is initialized only once in main thread
+        #[allow(static_mut_refs)]
         if CONFIG.is_some() {
             panic!("Config is already initialied")
         }
@@ -547,7 +792,9 @@ pub mod init {
             unsafe {
                 BASE_DATA_DIR = Some(base_dir);
             }
-            let config = Config::default();
+            let mut config = Config::default();
+            // provide two real directories so collection-number routing can be tested
+            config.base_dirs = vec![std::env::temp_dir(), std::env::temp_dir()];
             unsafe {
                 CONFIG = Some(config);
             }
@@ -588,5 +835,108 @@ mod tests {
         );
         let c3 = load_file("./test_data/transcodings.2.yaml");
         assert_eq!(c3.transcoding.get(QualityLevel::High).bitrate(), 96);
+    }
+
+    #[test]
+    fn test_thread_pool_config_check() {
+        let mut cfg = ThreadPoolConfig::default();
+
+        cfg.num_threads = 0;
+        assert!(cfg.check().is_err(), "num_threads=0 should fail");
+        cfg.num_threads = 1;
+        assert!(cfg.check().is_ok(), "num_threads=1 should pass");
+        cfg.num_threads = 32_768;
+        assert!(cfg.check().is_ok(), "num_threads=32768 should pass");
+        cfg.num_threads = 32_769;
+        assert!(cfg.check().is_err(), "num_threads=32769 should fail");
+
+        cfg.num_threads = 8;
+        cfg.queue_size = 9;
+        assert!(cfg.check().is_err(), "queue_size=9 should fail");
+        cfg.queue_size = 10;
+        assert!(cfg.check().is_ok(), "queue_size=10 should pass");
+        cfg.queue_size = 32_768;
+        assert!(cfg.check().is_ok(), "queue_size=32768 should pass");
+        cfg.queue_size = 32_769;
+        assert!(cfg.check().is_err(), "queue_size=32769 should fail");
+    }
+
+    #[test]
+    fn test_transcoding_config_check() {
+        let mut cfg = TranscodingConfig::default();
+
+        cfg.max_parallel_processes = 3;
+        assert!(cfg.check().is_err(), "max_parallel_processes=3 should fail");
+        cfg.max_parallel_processes = 4;
+        assert!(cfg.check().is_ok(), "max_parallel_processes=4 should pass");
+        cfg.max_parallel_processes = 200;
+        assert!(
+            cfg.check().is_ok(),
+            "max_parallel_processes=200 should pass"
+        );
+        cfg.max_parallel_processes = 201;
+        assert!(
+            cfg.check().is_err(),
+            "max_parallel_processes=201 should fail"
+        );
+
+        cfg.max_parallel_processes = 8;
+        cfg.max_runtime_hours = 0;
+        assert!(cfg.check().is_err(), "max_runtime_hours=0 should fail");
+        cfg.max_runtime_hours = 1;
+        assert!(cfg.check().is_ok(), "max_runtime_hours=1 should pass");
+    }
+
+    #[test]
+    fn test_collection_config_check() {
+        let mut cfg = CollectionConfig::default();
+
+        cfg.changes_debounce_interval = 0;
+        assert!(
+            cfg.check().is_err(),
+            "changes_debounce_interval=0 should fail"
+        );
+        cfg.changes_debounce_interval = 1;
+        assert!(
+            cfg.check().is_ok(),
+            "changes_debounce_interval=1 should pass"
+        );
+        cfg.changes_debounce_interval = 1800;
+        assert!(
+            cfg.check().is_ok(),
+            "changes_debounce_interval=1800 should pass"
+        );
+        cfg.changes_debounce_interval = 1801;
+        assert!(
+            cfg.check().is_err(),
+            "changes_debounce_interval=1801 should fail"
+        );
+    }
+
+    #[test]
+    fn test_config_get_tags() {
+        let mut cfg = Config::default();
+        assert!(cfg.get_tags().is_none(), "empty tags should return None");
+
+        cfg.tags.insert("artist".into());
+        cfg.tags.insert("album".into());
+        let tags = cfg.get_tags().expect("non-empty tags should return Some");
+        assert!(tags.contains("artist"));
+        assert!(tags.contains("album"));
+    }
+
+    #[test]
+    fn test_generate_tag() {
+        let t1 = generate_tag("pattern_one");
+        let t2 = generate_tag("pattern_one");
+        assert_eq!(t1, t2, "same input must produce same tag");
+        assert_eq!(t1.len(), 16, "tag must be 16 hex chars");
+
+        let t3 = generate_tag("pattern_two");
+        assert_ne!(t1, t3, "different inputs must produce different tags");
+
+        let t4 = generate_tag("yet_another_pattern");
+        assert_ne!(t1, t4);
+        assert_ne!(t3, t4);
     }
 }

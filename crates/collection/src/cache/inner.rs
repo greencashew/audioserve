@@ -1,12 +1,11 @@
 use std::{
-    collections::HashMap,
     ops::Deref,
     path::{Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
 
-use crossbeam_channel::Sender;
-use notify::DebouncedEvent;
+use crossbeam_channel::Receiver;
 use serde_json::Value;
 use sled::{
     transaction::{self, TransactionError, Transactional},
@@ -17,13 +16,13 @@ use crate::{
     audio_folder::{DirType, FolderLister},
     audio_meta::{AudioFolder, TimeStamp},
     cache::{
-        update::RecursiveUpdater,
+        update::{RecursiveUpdater, UpdateActionKind},
         util::{split_path, update_path},
     },
     common::PositionsData,
     error::{Error, Result},
-    position::{PositionItem, PositionRecord, MAX_GROUPS},
-    util::{get_file_name, get_meta, get_modified},
+    position::{PositionItem, PositionRecord, PositionsCollector, MAX_GROUPS},
+    util::{get_file_name, get_modified},
     AudioFolderShort, FoldersOrdering, Position,
 };
 
@@ -39,7 +38,8 @@ pub(crate) struct CacheInner {
     pos_folder: Tree,
     lister: FolderLister,
     base_dir: PathBuf,
-    update_sender: Sender<Option<UpdateAction>>,
+    time_to_folder_end: u32,
+    update_receiver: Option<Receiver<Option<UpdateAction>>>,
 }
 
 impl CacheInner {
@@ -48,7 +48,8 @@ impl CacheInner {
 
         lister: FolderLister,
         base_dir: PathBuf,
-        update_sender: Sender<Option<UpdateAction>>,
+        time_to_folder_end: u32,
+        update_receiver: Option<Receiver<Option<UpdateAction>>>,
     ) -> Result<Self> {
         let pos_latest = db.open_tree("pos_latest")?;
         let pos_folder = db.open_tree("pos_folder")?;
@@ -58,8 +59,24 @@ impl CacheInner {
             pos_folder,
             lister,
             base_dir,
-            update_sender,
+            time_to_folder_end,
+            update_receiver,
         })
+    }
+
+    pub(crate) fn run_update_loop(self: Arc<Self>) {
+        if let Some(ref receiver) = self.update_receiver {
+            loop {
+                match receiver.recv() {
+                    Ok(Some(action)) => self.proceed_update(action),
+                    Ok(None) => break,
+                    Err(_) => {
+                        error!("Update channel disconnected");
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -87,10 +104,10 @@ impl CacheInner {
         for key in self.iter_folders().filter_map(|e| e.ok()).map(|(k, _)| k) {
             if let Ok(rel_path) = std::str::from_utf8(&key) {
                 let full_path = self.base_dir.join(rel_path);
-                if !full_path.exists() {
+                if !full_path.exists() || self.lister.is_collapsable_folder(&full_path) {
                     debug!("Removing {:?} from collection cache db", full_path);
                     self.remove(rel_path)
-                        .map_err(|e| error!("cannot remove revord from db: {}", e))
+                        .map_err(|e| error!("cannot remove record from db: {}", e))
                         .ok();
                 }
             }
@@ -110,6 +127,13 @@ impl CacheInner {
                     .flatten()
             })
             .and_then(deser_audiofolder)
+    }
+
+    pub(crate) fn has_key<P: AsRef<Path>>(&self, dir: P) -> bool {
+        dir.as_ref()
+            .to_str()
+            .and_then(|p| self.db.contains_key(p.as_bytes()).ok())
+            .unwrap_or(false)
     }
 
     pub(crate) fn get_if_actual<P: AsRef<Path>>(
@@ -138,12 +162,8 @@ impl CacheInner {
     }
 
     pub(crate) fn update<P: AsRef<Path>>(&self, dir: P, af: AudioFolder) -> Result<()> {
-        let dir = dir
-            .as_ref()
-            .to_str()
-            .ok_or_else(|| Error::InvalidCollectionPath)?;
-        bincode::serialize(&af)
-            .map_err(Error::from)
+        let dir = dir.as_ref().to_str().ok_or(Error::InvalidCollectionPath)?;
+        crate::serialize(&af)
             .and_then(|data| self.db.insert(dir, data).map_err(Error::from))
             .map(|_| debug!("Cache updated for {:?}", dir))
     }
@@ -190,11 +210,11 @@ impl CacheInner {
     }
 
     pub fn flush(&self) -> Result<()> {
-        let mut res = vec![];
-        res.push(self.db.flush());
-        res.push(self.pos_folder.flush());
-        res.push(self.pos_latest.flush());
-
+        let res = vec![
+            self.db.flush(),
+            self.pos_folder.flush(),
+            self.pos_latest.flush(),
+        ];
         res.into_iter()
             .find(|r| r.is_err())
             .unwrap_or(Ok(0))
@@ -203,9 +223,68 @@ impl CacheInner {
     }
 }
 
+fn get_pos_record<K>(k: &K, db: &transaction::TransactionalTree) -> Option<PositionRecord>
+where
+    K: AsRef<[u8]> + ?Sized,
+{
+    db.get(k.as_ref())
+        .map_err(|e| error!("Db get error: {}", e))
+        .ok()
+        .flatten()
+        .and_then(|data| {
+            crate::deserialize::<PositionRecord>(&data)
+                .map_err(|e| error!("Db item deserialization error: {}", e))
+                .ok()
+        })
+}
+
 // positions
 impl CacheInner {
-    const EOB_LIMIT: u32 = 10;
+    pub(crate) fn mark_as_finished<P, S>(
+        &self,
+        group: S,
+        path: P,
+        ts: Option<TimeStamp>,
+    ) -> Result<()>
+    where
+        S: AsRef<str>,
+        P: AsRef<str>,
+    {
+        self.pos_folder
+            .transaction(|pos_folder| {
+                let mut folder_rec = get_pos_record(path.as_ref(), pos_folder).unwrap_or_default();
+                let ts = ts.unwrap_or_else(TimeStamp::now);
+                match folder_rec.get_mut(group.as_ref()) {
+                    Some(p) => {
+                        p.folder_finished = true;
+                        p.timestamp = ts;
+                    }
+                    None => {
+                        if !folder_rec.contains_key(group.as_ref())
+                            && folder_rec.len() >= MAX_GROUPS
+                        {
+                            return transaction::abort(Error::TooManyGroups);
+                        }
+                        folder_rec.insert(
+                            group.as_ref().to_string(),
+                            PositionItem {
+                                file: "__PLACEHOLDER__".into(),
+                                timestamp: ts,
+                                position: 0.0,
+                                folder_finished: true,
+                            },
+                        );
+                    }
+                }
+                match crate::serialize(&folder_rec) {
+                    Ok(data) => pos_folder.insert(path.as_ref().as_bytes(), data)?,
+                    Err(e) => return transaction::abort(e),
+                };
+
+                Ok(())
+            })
+            .map_err(Error::from)
+    }
 
     pub(crate) fn insert_position<S, P>(
         &self,
@@ -221,27 +300,20 @@ impl CacheInner {
         P: AsRef<str>,
     {
         let (path, file) = split_path(&path);
-        if let Some((last_file, last_file_duration)) = self.get_last_file(&path) {
+        if let Some((last_file, last_file_duration)) = self.get_last_file(path) {
             (&self.pos_latest, &self.pos_folder)
                 .transaction(move |(pos_latest, pos_folder)| {
-                    let mut folder_rec = pos_folder
-                        .get(&path)
-                        .map_err(|e| error!("Db get error: {}", e))
-                        .ok()
-                        .flatten()
-                        .and_then(|data| {
-                            bincode::deserialize::<PositionRecord>(&data)
-                                .map_err(|e| error!("Db item deserialization error: {}", e))
-                                .ok()
-                        })
-                        .unwrap_or_else(HashMap::new);
+                    let mut folder_rec = get_pos_record(path,pos_folder)
+                        .unwrap_or_default();
 
                     if let Some(ts) = ts {
                         if let Some(current_record) = folder_rec.get(group.as_ref()) {
                             if current_record.timestamp > ts {
                                 info!(
-                                    "Position not inserted for folder {} because it's outdated",
-                                    path
+                                    "Position not inserted for folder {} because it's outdated. It has timestamp {:?}, but we have ts {:?}",
+                                    path,
+                                    ts,
+                                    current_record.timestamp
                                 );
                                 return transaction::abort(Error::IgnoredPosition);
                             } else {
@@ -256,12 +328,12 @@ impl CacheInner {
                         folder_finished: finished
                             || (file.eq(&last_file)
                                 && last_file_duration
-                                    .and_then(|d| d.checked_sub(position.round() as u32))
-                                    .map(|dif| dif < CacheInner::EOB_LIMIT)
+                                    .map(|d| d.saturating_sub(position.round() as u32))
+                                    .map(|dif| dif < self.time_to_folder_end)
                                     .unwrap_or(false)),
                         file: file.into(),
-                        timestamp: if use_ts && ts.is_some() {
-                            ts.unwrap()
+                        timestamp: if let (true, Some(ts)) = (use_ts, ts) {
+                            ts
                         } else {
                             TimeStamp::now()
                         },
@@ -273,8 +345,8 @@ impl CacheInner {
                     }
 
                     folder_rec.insert(group.as_ref().into(), this_pos);
-                    let rec = match bincode::serialize(&folder_rec) {
-                        Err(e) => return transaction::abort(Error::from(e)),
+                    let rec = match crate::serialize(&folder_rec) {
+                        Err(e) => return transaction::abort(e),
                         Ok(res) => res,
                     };
 
@@ -282,14 +354,14 @@ impl CacheInner {
                     pos_latest.insert(group.as_ref(), path.as_bytes())?;
                     Ok(())
                 })
-                .map_err(|e| Error::from(e))
+                .map_err(Error::from)
         } else {
             // folder does not have playable file or does not exist in cache
             warn!(
                 "Trying to insert position for unknown or empty folder {}",
                 path
             );
-            return Err(Error::IgnoredPosition);
+            Err(Error::IgnoredPosition)
         }
     }
 
@@ -313,17 +385,8 @@ impl CacheInner {
                     None => return Ok(None),
                 };
 
-                Ok(pos_folder
-                    .get(&fld)
-                    .map_err(|e| error!("Error reading position folder record in db: {}", e))
-                    .ok()
-                    .flatten()
-                    .and_then(|r| {
-                        bincode::deserialize::<PositionRecord>(&r)
-                            .map_err(|e| error!("Error deserializing position record {}", e))
-                            .ok()
-                    })
-                    .and_then(|m| m.get(group.as_ref()).map(|p| p.into_position(fld, 0))))
+                Ok(get_pos_record(&fld, pos_folder)
+                    .and_then(|m| m.get(group.as_ref()).map(|p| p.to_position(fld, 0))))
             })
             .map_err(|e: TransactionError<Error>| error!("Db transaction error: {}", e))
             .ok()
@@ -335,8 +398,8 @@ impl CacheInner {
         group: S,
         folder: P,
         collection_no: usize,
-    ) -> Vec<Position>
-    where
+        res: &mut PositionsCollector,
+    ) where
         S: AsRef<str>,
         P: AsRef<str>,
     {
@@ -344,6 +407,7 @@ impl CacheInner {
             self.pos_folder.scan_prefix(folder.as_ref()),
             group,
             collection_no,
+            res,
         )
     }
 
@@ -358,7 +422,7 @@ impl CacheInner {
             .ok()
             .flatten()
             .and_then(|r| {
-                bincode::deserialize::<PositionRecord>(&r)
+                crate::deserialize::<PositionRecord>(&r)
                     .map_err(|e| error!("Error deserializing position record {}", e))
                     .ok()
             })
@@ -366,22 +430,30 @@ impl CacheInner {
             .unwrap_or(false)
     }
 
+    pub(crate) fn update_subfolder<S: AsRef<str>>(&self, group: S, sf: &mut AudioFolderShort) {
+        sf.finished = sf
+            .path
+            .to_str()
+            .map(|path| self.is_finished(&group, path))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn update_subfolders<S: AsRef<str>>(
         &self,
         group: S,
-        subfolders: &mut Vec<AudioFolderShort>,
+        subfolders: &mut [AudioFolderShort],
     ) {
-        subfolders.iter_mut().for_each(|sf| {
-            sf.finished = sf
-                .path
-                .to_str()
-                .map(|path| self.is_finished(&group, path))
-                .unwrap_or(false)
-        })
+        subfolders
+            .iter_mut()
+            .for_each(|sf| self.update_subfolder(&group, sf))
     }
 
-    fn positions_from_iter<I, S>(iter: I, group: S, collection_no: usize) -> Vec<Position>
-    where
+    fn positions_from_iter<I, S>(
+        iter: I,
+        group: S,
+        collection_no: usize,
+        res: &mut PositionsCollector,
+    ) where
         I: Iterator<Item = std::result::Result<(sled::IVec, sled::IVec), sled::Error>>,
         S: AsRef<str>,
     {
@@ -389,33 +461,32 @@ impl CacheInner {
             res.map_err(|e| error!("Error reading from positions db: {}", e))
                 .ok()
                 .and_then(|(folder, rec)| {
-                    let rec: PositionRecord = bincode::deserialize(&rec)
+                    let rec: PositionRecord = crate::deserialize(&rec)
                         .map_err(|e| error!("Position deserialization error: {}", e))
                         .ok()?;
                     let folder = String::from_utf8(folder.as_ref().into()).unwrap(); // known to be valid UTF8
                     rec.get(group.as_ref())
-                        .map(|p| p.into_position(folder, collection_no))
+                        .map(|p| p.to_position(folder, collection_no))
                 })
         })
-        .take(1000) //TODO: this is just temporary safety limit, think about better ways to limit
-        .collect()
+        .for_each(|p| res.add(p))
     }
 
     pub(crate) fn get_all_positions_for_group<S>(
         &self,
         group: S,
         collection_no: usize,
-    ) -> Vec<Position>
-    where
+        res: &mut PositionsCollector,
+    ) where
         S: AsRef<str>,
     {
-        CacheInner::positions_from_iter(self.pos_folder.iter(), group, collection_no)
+        CacheInner::positions_from_iter(self.pos_folder.iter(), group, collection_no, res)
     }
 
     fn remove_positions_batch<P: AsRef<Path>>(&self, path: P) -> Result<Batch> {
         let mut batch = Batch::default();
         self.pos_folder
-            .scan_prefix(path.as_ref().to_str().ok_or_else(|| Error::InvalidPath)?)
+            .scan_prefix(path.as_ref().to_str().ok_or(Error::InvalidPath)?)
             .filter_map(|r| {
                 r.map_err(|e| error!("Cannot read positions db: {}", e))
                     .ok()
@@ -439,7 +510,7 @@ impl CacheInner {
 
         let iter = self
             .pos_folder
-            .scan_prefix(from.to_str().ok_or_else(|| Error::InvalidPath)?)
+            .scan_prefix(from.to_str().ok_or(Error::InvalidPath)?)
             .filter_map(|r| {
                 r.map_err(|e| error!("Cannot read positions db: {}", e))
                     .ok()
@@ -503,19 +574,19 @@ impl CacheInner {
             .ok();
     }
 
-    pub(crate) fn write_json_positions<F: std::io::Write>(&self, mut file: &mut F) -> Result<()> {
+    pub(crate) fn write_json_positions<F: std::io::Write>(&self, file: &mut F) -> Result<()> {
         write!(file, "{{")?;
         for (idx, res) in self.pos_folder.iter().enumerate() {
             match res {
                 Ok((k, v)) => {
                     let folder = std::str::from_utf8(&k)?;
-                    let res: PositionRecord = bincode::deserialize(&v)?;
+                    let res: PositionRecord = crate::deserialize(&v)?;
                     write!(file, "\"{}\":", folder)?;
-                    serde_json::to_writer(&mut file, &res)?;
+                    serde_json::to_writer(&mut *file, &res)?;
                     if idx < self.pos_folder.len() - 1 {
-                        write!(file, ",\n")?;
+                        writeln!(file, ",")?;
                     } else {
-                        write!(file, "\n")?;
+                        writeln!(file)?;
                     }
                 }
                 Err(e) => error!("Error when reading from position db: {}", e),
@@ -594,10 +665,10 @@ impl CacheInner {
         for item in self.db.scan_prefix(from.to_str().unwrap()) {
             // safe to unwrap as we insert only valid strings
             let (k, v) = item?;
-            let mut folder_rec: AudioFolder = bincode::deserialize(&v)?;
+            let mut folder_rec: AudioFolder = crate::deserialize(&v)?;
             let p: &Path = Path::new(unsafe { std::str::from_utf8_unchecked(&k) }); // we insert only valid strings as keys
             let new_key = update_path(from, to, p)?;
-            let new_key = new_key.to_str().ok_or_else(|| Error::InvalidPath)?;
+            let new_key = new_key.to_str().ok_or(Error::InvalidPath)?;
             trace!(
                 "Processing path {} from key {} in to {:?}",
                 new_key,
@@ -634,7 +705,7 @@ impl CacheInner {
                 folder_rec.cover = Some(c);
             }
 
-            insert_batch.insert(new_key, bincode::serialize(&folder_rec)?);
+            insert_batch.insert(new_key, crate::serialize(&folder_rec)?);
         }
 
         self.db
@@ -648,24 +719,31 @@ impl CacheInner {
 
     pub(crate) fn proceed_update(&self, update: UpdateAction) {
         debug!("Update action: {:?}", update);
-        match update {
-            UpdateAction::RefreshFolder(folder) => {
+        let folder = update.path;
+        match update.kind {
+            UpdateActionKind::RefreshFolder => {
                 self.force_update(&folder, false)
                     .map_err(|e| warn!("Error updating folder in cache: {}", e))
                     .ok();
             }
-            UpdateAction::RefreshFolderRecursive(folder) => {
+            UpdateActionKind::RefreshFolderRecursive => {
                 self.force_update_recursive(folder);
             }
-            UpdateAction::RemoveFolder(folder) => {
+            UpdateActionKind::RemoveFolder => {
                 self.remove_tree(&folder)
                     .map_err(|e| warn!("Error removing folder from cache: {}", e))
                     .ok();
-                self.force_update(parent_path(&folder), false).ok();
             }
-            UpdateAction::RenameFolder { from, to } => {
+            UpdateActionKind::RenameFolder { to } => {
+                //if destination exists in cache let's delete it
+                if self.has_key(&to) {
+                    self.remove_tree(&to)
+                        .map_err(|e| warn!("Error removing folder from cache: {}", e))
+                        .ok();
+                }
+                let from = folder;
                 if let Err(e) = self.update_recursive_after_rename(&from, &to) {
-                    error!("Faild to do recusrsive rename, error: {}, we will have to do rescan of {:?}", e, &to);
+                    error!("Failed to do recursive rename, error: {}, we will have to do rescan of {:?}", e, to);
                     self.remove_tree(&from)
                         .map_err(|e| warn!("Error removing folder from cache: {}", e))
                         .ok();
@@ -680,73 +758,26 @@ impl CacheInner {
                         .map_err(|e| error!("Even deleting positions failed: {}", e))
                         .ok();
                 }
-                let orig_parent = parent_path(&from);
-                let new_parent = parent_path(&to);
-                self.force_update(&orig_parent, false).ok();
-                if new_parent != orig_parent {
-                    self.force_update(&new_parent, false).ok();
-                }
             }
         }
     }
 
-    pub(crate) fn proceed_event(&self, evt: DebouncedEvent) {
-        let snd = |a| {
-            self.update_sender
-                .send(Some(a))
-                .map_err(|e| error!("Error sending update {}", e))
-                .ok()
-                .unwrap_or(())
-        };
-        match evt {
-            DebouncedEvent::Create(p) => {
-                let col_path = self.strip_base(&p);
-                if self.is_dir(&p) {
-                    snd(UpdateAction::RefreshFolderRecursive(col_path.into()));
-                    snd(UpdateAction::RefreshFolder(parent_path(col_path)));
-                } else {
-                    snd(UpdateAction::RefreshFolder(parent_path(col_path)));
-                }
-            }
-            DebouncedEvent::Write(p) => {
-                let col_path = self.strip_base(&p);
-                // TODO - check can get Write on directory?
-                if self.is_dir(&p) {
-                    // should be single file folder
-                    snd(UpdateAction::RefreshFolder(col_path.into()));
-                } else {
-                    snd(UpdateAction::RefreshFolder(parent_path(col_path)));
-                }
-            }
-            DebouncedEvent::Remove(p) => {
-                let col_path = self.strip_base(&p);
-                if self.is_dir(&p) {
-                    snd(UpdateAction::RemoveFolder(col_path.into()));
-                } else {
-                    snd(UpdateAction::RefreshFolder(parent_path(col_path)))
-                }
-            }
-            DebouncedEvent::Rename(p1, p2) => {
-                let col_path = self.strip_base(&p1);
-                match (p2.starts_with(&self.base_dir), self.is_dir(&p1)) {
-                    (true, true) => snd(UpdateAction::RenameFolder {
-                        from: col_path.into(),
-                        to: self.strip_base(&p2).into(),
-                    }),
-                    (true, false) => snd(UpdateAction::RefreshFolder(parent_path(col_path))),
-                    (false, true) => snd(UpdateAction::RemoveFolder(col_path.into())),
-                    (false, false) => snd(UpdateAction::RefreshFolder(parent_path(col_path))),
-                }
-            }
-            other => {
-                error!("This event {:?} should not get here", other);
-                return;
-            }
-        };
+    pub(crate) fn get_true_parent(&self, rel_path: &Path, full_path: &Path) -> PathBuf {
+        let parent = parent_path(rel_path);
+        if self.lister.collapse_cd_enabled()
+            && full_path
+                .parent()
+                .map(|p| self.path_type(p).is_collapsed())
+                .unwrap_or(false)
+        {
+            parent_path(parent)
+        } else {
+            parent
+        }
     }
 
     /// must be used only on paths with this collection
-    fn strip_base<'a, P>(&self, full_path: &'a P) -> &'a Path
+    pub(crate) fn strip_base<'a, P>(&self, full_path: &'a P) -> &'a Path
     where
         P: AsRef<Path>,
     {
@@ -754,37 +785,65 @@ impl CacheInner {
     }
 
     /// only for absolute paths
-    fn is_dir<P: AsRef<Path>>(&self, full_path: P) -> bool {
+    pub(crate) fn path_type<P: AsRef<Path>>(&self, full_path: P) -> FolderType {
         let full_path: &Path = full_path.as_ref();
-        assert!(full_path.is_absolute());
+        assert!(full_path.is_absolute(), "path {:?}", full_path);
         let col_path = self.strip_base(&full_path);
-        if col_path
-            .to_str()
-            .and_then(|p| self.db.contains_key(p.as_bytes()).ok())
-            .unwrap_or(false)
-        {
-            // it has been identified as directory before
-            // TODO: but it can change - for instance if chapter metadata are removed from file
-            return true;
-        }
-        let meta = if let Ok(meta) = get_meta(full_path) {
-            meta
-        } else {
-            return false;
-        };
-        if meta.is_dir() {
-            true
-        } else {
-            match self.lister.get_dir_type(full_path) {
-                Ok(DirType::Dir) => true,
-                Ok(DirType::File { .. }) => false,
-                Ok(DirType::Other) => false,
-                Err(e) => {
-                    error!("Error id determining dir type: {}", e);
-                    false
+        match self.lister.get_dir_type(full_path) {
+            Ok(DirType::Dir) => {
+                if self.has_key(col_path) {
+                    FolderType::RegularDir
+                } else if self.lister.is_collapsable_folder(col_path) {
+                    FolderType::CollapsedDir
+                } else {
+                    FolderType::NewDir
+                }
+            }
+            Ok(DirType::File { .. }) => {
+                if self.has_key(col_path) {
+                    FolderType::FileDir
+                } else {
+                    FolderType::NewFileDir
+                }
+            }
+            Ok(DirType::Other) => FolderType::RegularFile,
+            Err(e) => {
+                if !matches!(e.kind(), std::io::ErrorKind::NotFound) {
+                    error!("Error determining dir type: {}", e);
+                    FolderType::Unknown
+                } else if self.has_key(col_path) {
+                    FolderType::DeletedDir
+                } else {
+                    FolderType::Unknown
                 }
             }
         }
+    }
+
+    pub(crate) fn is_collapsable_folder(&self, p: impl AsRef<Path>) -> bool {
+        self.lister.is_collapsable_folder(p)
+    }
+}
+
+pub enum FolderType {
+    RegularDir,
+    DeletedDir,
+    FileDir,
+    RegularFile,
+    CollapsedDir,
+    NewDir,
+    NewFileDir,
+    Unknown,
+}
+
+impl FolderType {
+    pub fn is_dir(&self) -> bool {
+        use FolderType::*;
+        !matches!(self, RegularFile | Unknown | CollapsedDir)
+    }
+
+    pub fn is_collapsed(&self) -> bool {
+        matches!(self, FolderType::CollapsedDir)
     }
 }
 

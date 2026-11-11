@@ -5,8 +5,9 @@ use std::time::SystemTime;
 
 use crate::audio_folder::FolderLister;
 use crate::audio_meta::AudioFolder;
-use crate::common::{CollectionTrait, PositionsData, PositionsTrait};
+use crate::common::{CollectionOptions, CollectionTrait, PositionsData, PositionsTrait};
 use crate::error::{Error, Result};
+use crate::position::PositionsCollector;
 use crate::util::get_real_file_type;
 use crate::AudioFolderShort;
 
@@ -17,11 +18,13 @@ pub(crate) struct CollectionDirect {
 }
 
 impl CollectionDirect {
-    pub(crate) fn new(base_dir: PathBuf, lister: FolderLister, allow_symlinks: bool) -> Self {
+    pub(crate) fn new(base_dir: PathBuf, opt: CollectionOptions) -> Self {
         CollectionDirect {
             base_dir,
-            lister,
-            searcher: FoldersSearch { allow_symlinks },
+            searcher: FoldersSearch {
+                allow_symlinks: opt.allow_symlinks,
+            },
+            lister: FolderLister::new_with_options(opt.into()),
         }
     }
 }
@@ -41,15 +44,27 @@ impl CollectionTrait for CollectionDirect {
             .map_err(Error::from)
     }
 
+    fn get_folder_cover_path(&self, dir_path: impl AsRef<Path>) -> Result<Option<PathBuf>> {
+        self.lister
+            .list_dir(
+                &self.base_dir,
+                dir_path,
+                crate::FoldersOrdering::Alphabetical,
+            )
+            .map(|af| af.cover.map(|f| f.path))
+            .map_err(Error::from)
+        // TODO: This is quite ineffective to list whole folder
+    }
+
     fn flush(&self) -> Result<()> {
         Ok(())
     }
 
-    fn search<S: AsRef<str>>(&self, q: S) -> Vec<crate::AudioFolderShort> {
+    fn search<S: AsRef<str>>(&self, q: S, _group: Option<String>) -> Vec<crate::AudioFolderShort> {
         self.searcher.search_folder(&self.base_dir, q)
     }
 
-    fn recent(&self, limit: usize) -> Vec<crate::AudioFolderShort> {
+    fn recent(&self, limit: usize, _group: Option<String>) -> Vec<crate::AudioFolderShort> {
         self.searcher
             .search_folder_for_recent(&self.base_dir, limit)
     }
@@ -62,6 +77,19 @@ impl CollectionTrait for CollectionDirect {
 }
 
 impl PositionsTrait for CollectionDirect {
+    fn mark_as_finished<P, S>(
+        &self,
+        _group: S,
+        _path: P,
+        _ts: Option<crate::audio_meta::TimeStamp>,
+    ) -> Result<()>
+    where
+        S: AsRef<str>,
+        P: AsRef<str>,
+    {
+        Ok(())
+    }
+
     fn insert_position<S, P>(
         &self,
         _group: S,
@@ -89,11 +117,10 @@ impl PositionsTrait for CollectionDirect {
         &self,
         _group: S,
         _collection_no: usize,
-    ) -> Vec<crate::Position>
-    where
+        _res: &mut PositionsCollector,
+    ) where
         S: AsRef<str>,
     {
-        vec![]
     }
 
     fn write_json_positions<F: std::io::Write>(&self, _file: &mut F) -> Result<()> {
@@ -109,12 +136,11 @@ impl PositionsTrait for CollectionDirect {
         _group: S,
         _folder: P,
         _collection_no: usize,
-    ) -> Vec<crate::Position>
-    where
+        _res: &mut PositionsCollector,
+    ) where
         S: AsRef<str>,
         P: AsRef<str>,
     {
-        vec![]
     }
 }
 
@@ -126,6 +152,7 @@ struct DirEntry {
 
 // need reverse ordering for heap, oldest will be on top
 use std::cmp::Ordering;
+#[allow(clippy::non_canonical_partial_ord_impl)]
 impl PartialOrd for DirEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(match self.created.cmp(&other.created) {
@@ -137,7 +164,7 @@ impl PartialOrd for DirEntry {
 }
 impl Ord for DirEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(&other).unwrap()
+        self.partial_cmp(other).unwrap()
     }
 }
 
@@ -154,31 +181,28 @@ impl FoldersSearch {
         let mut recents: BinaryHeap<DirEntry> = BinaryHeap::with_capacity(limit);
 
         fn search_recursive(
-            base_path: &Path,
             path: &Path,
             res: &mut BinaryHeap<DirEntry>,
             allow_symlinks: bool,
             limit: usize,
         ) {
             if let Ok(dir_iter) = fs::read_dir(path) {
-                for item in dir_iter {
-                    if let Ok(f) = item {
-                        if let Ok(ft) = get_real_file_type(&f, path, allow_symlinks) {
-                            if ft.is_dir() {
-                                let p = f.path();
-                                search_recursive(base_path, &p, res, allow_symlinks, limit);
-                                if let Ok(meta) = p.metadata() {
-                                    let changed = meta.modified();
+                for f in dir_iter.flatten() {
+                    if let Ok(ft) = get_real_file_type(&f, path, allow_symlinks) {
+                        if ft.is_dir() {
+                            let p = f.path();
+                            search_recursive(&p, res, allow_symlinks, limit);
+                            if let Ok(meta) = p.metadata() {
+                                let changed = meta.modified();
 
-                                    if let Ok(changed) = changed {
-                                        if res.len() >= limit {
-                                            res.pop();
-                                        }
-                                        res.push(DirEntry {
-                                            path: p,
-                                            created: changed,
-                                        })
+                                if let Ok(changed) = changed {
+                                    if res.len() >= limit {
+                                        res.pop();
                                     }
+                                    res.push(DirEntry {
+                                        path: p,
+                                        created: changed,
+                                    })
                                 }
                             }
                         }
@@ -188,10 +212,10 @@ impl FoldersSearch {
         }
         let base_path = base_dir.as_ref();
         let allow_symlinks = self.allow_symlinks;
-        search_recursive(base_path, base_path, &mut recents, allow_symlinks, limit);
+        search_recursive(base_path, &mut recents, allow_symlinks, limit);
         let dirs = recents.into_sorted_vec();
         dirs.into_iter()
-            .map(|e| AudioFolderShort::from_path(base_path, e.path))
+            .map(|e| AudioFolderShort::from_path_simple(base_path, e.path))
             .collect()
     }
 
@@ -208,32 +232,22 @@ impl FoldersSearch {
             allow_symlinks: bool,
         ) {
             if let Ok(dir_iter) = fs::read_dir(path) {
-                for item in dir_iter {
-                    if let Ok(f) = item {
-                        if let Ok(ft) = get_real_file_type(&f, path, allow_symlinks) {
-                            if ft.is_dir() {
-                                let p = f.path();
-                                if let Some(s) =
-                                    p.strip_prefix(base_path).ok().and_then(Path::to_str)
-                                {
-                                    let lc_s = s.to_lowercase();
-                                    let m = tokens.iter().all(|token| lc_s.contains(token));
-                                    if m {
-                                        debug!("Found {:?} in {}", tokens, lc_s);
-                                        let folder =
-                                            AudioFolderShort::from_dir_entry(&f, s.into(), false);
-                                        if let Ok(folder) = folder {
-                                            results.push(folder)
-                                        }
-                                    } else {
-                                        search_recursive(
-                                            base_path,
-                                            &p,
-                                            results,
-                                            tokens,
-                                            allow_symlinks,
-                                        )
+                for f in dir_iter.flatten() {
+                    if let Ok(ft) = get_real_file_type(&f, path, allow_symlinks) {
+                        if ft.is_dir() {
+                            let p = f.path();
+                            if let Some(s) = p.strip_prefix(base_path).ok().and_then(Path::to_str) {
+                                let lc_s = s.to_lowercase();
+                                let m = tokens.iter().all(|token| lc_s.contains(token));
+                                if m {
+                                    debug!("Found {:?} in {}", tokens, lc_s);
+                                    let folder =
+                                        AudioFolderShort::from_path_complete(&p, s.into(), false);
+                                    if let Ok(folder) = folder {
+                                        results.push(folder)
                                     }
+                                } else {
+                                    search_recursive(base_path, &p, results, tokens, allow_symlinks)
                                 }
                             }
                         }

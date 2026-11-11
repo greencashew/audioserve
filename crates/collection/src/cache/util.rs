@@ -9,14 +9,14 @@ pub fn update_path(
 ) -> std::result::Result<PathBuf, std::path::StripPrefixError> {
     let p = p.strip_prefix(from)?;
     //Unfortunatelly join adds traling slash if joined path is empty, which causes problem, so we need to handle this special case
-    if p.to_str().map(|s| s.is_empty()).unwrap_or(false) {
+    if p.as_os_str().is_empty() {
         return Ok(to.into());
     }
     Ok(to.join(p))
 }
 
 pub fn deser_audiofolder<T: AsRef<[u8]>>(data: T) -> Option<AudioFolder> {
-    bincode::deserialize(data.as_ref())
+    crate::deserialize(data.as_ref())
         .map_err(|e| error!("Error deserializing data from db {}", e))
         .ok()
 }

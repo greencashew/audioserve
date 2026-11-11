@@ -1,22 +1,19 @@
 #[macro_use]
 extern crate log;
 #[macro_use]
-extern crate serde_derive;
-#[macro_use]
 extern crate lazy_static;
 
-use collection::audio_folder::FoldersOptions;
-use collection::common::CollectionOptions;
-use collection::Collections;
+// #[cfg(feature = "tls")]
+// use crate::tls::TlsStream;
+use collection::{CollectionOptions, CollectionOptionsMap, Collections};
 use config::{get_config, init_config};
 use error::{bail, Context, Error};
 use futures::prelude::*;
-use hyper::{service::make_service_fn, Server as HttpServer};
+use myhy::server::tls::TlsConfig;
 use ring::rand::{SecureRandom, SystemRandom};
 use services::{
     auth::SharedSecretAuthenticator, search::Search, ServiceFactory, TranscodingDetails,
 };
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,12 +23,17 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use tokio::sync::{oneshot, watch};
+
+use myhy::server::HttpServer;
+
+use crate::services::auth::signed_url::SignedUrlService;
 
 mod config;
 mod error;
 mod services;
-#[cfg(feature = "tls")]
-mod tls;
+// #[cfg(feature = "tls")]
+// mod tls;
 mod util;
 
 fn generate_server_secret<P: AsRef<Path>>(file: P) -> Result<Vec<u8>, Error> {
@@ -50,7 +52,7 @@ fn generate_server_secret<P: AsRef<Path>>(file: P) -> Result<Vec<u8>, Error> {
         let mut random = [0u8; 32];
         let rng = SystemRandom::new();
         rng.fill(&mut random)
-            .map_err(|_e| io::Error::new(io::ErrorKind::Other, "Error when generating secret"))?;
+            .map_err(|_e| io::Error::other("Error when generating secret"))?;
         let mut f;
         #[cfg(unix)]
         {
@@ -82,66 +84,88 @@ macro_rules! get_url_path {
     };
 }
 
-fn create_folder_options() -> (FoldersOptions, HashMap<PathBuf, CollectionOptions>) {
-    let fo = FoldersOptions {
-        allow_symlinks: get_config().allow_symlinks,
-        chapters_duration: get_config().chapters.duration,
-        chapters_from_duration: get_config().chapters.from_duration,
-        ignore_chapters_meta: get_config().ignore_chapters_meta,
-        no_dir_collaps: get_config().no_dir_collaps,
-        tags: Arc::new(get_config().get_tags()),
-        force_cache_update_on_init: get_config().force_cache_update_on_init,
-    };
-    let co: HashMap<_, _> = get_config()
-        .base_dirs_options
-        .iter()
-        .map(|(p, o)| {
-            (
-                p.clone(),
-                CollectionOptions {
-                    no_cache: o.no_cache,
-                },
-            )
-        })
-        .collect();
+fn create_collections_options() -> anyhow::Result<CollectionOptionsMap> {
+    let c = get_config();
+    let mut fo = CollectionOptions::default();
 
-    (fo, co)
+    fo.allow_symlinks = c.allow_symlinks;
+    fo.chapters_duration = c.chapters.duration;
+    fo.chapters_from_duration = c.chapters.from_duration;
+    fo.ignore_chapters_meta = c.ignore_chapters_meta;
+    fo.no_dir_collaps = c.no_dir_collaps;
+    fo.tags = c.get_tags();
+    fo.cd_folder_regex_str = c.collapse_cd_folders.as_ref().and_then(|x| x.regex.clone());
+    fo.force_cache_update_on_init = c.force_cache_update_on_init;
+    fo.natural_files_ordering = c.natural_files_ordering;
+    fo.time_to_end_of_folder = c.time_to_folder_end;
+    fo.read_playlists = c.read_playlist;
+    fo.changes_debounce_interval = c.collections_options.changes_debounce_interval;
+    fo.watch_for_changes = !c.collections_options.dont_watch_for_changes;
+
+    #[cfg(feature = "tags-encoding")]
+    {
+        fo.tags_encoding.clone_from(&c.tags_encoding);
+    }
+
+    let mut co = CollectionOptionsMap::new(fo)?;
+    for (p, o) in &get_config().base_dirs_options {
+        if let Err(e) = co.add_col_options(p, o) {
+            error!("Invalid option(s) for collection directory {:?}:{}", p, e);
+            bail!(e)
+        }
+    }
+
+    Ok(co)
 }
 
-fn create_collections() -> Arc<Collections> {
-    let (fo, co) = create_folder_options();
-    Arc::new(
+fn create_collections() -> anyhow::Result<Arc<Collections>> {
+    let opt = create_collections_options()?;
+    Ok(Arc::new(
         Collections::new_with_detail::<Vec<PathBuf>, _, _>(
             get_config().base_dirs.clone(),
-            co,
+            opt,
             get_config().collections_cache_dir.as_path(),
-            fo,
         )
         .expect("Unable to create collections cache"),
-    )
+    ))
 }
 
 #[cfg(feature = "shared-positions")]
 fn restore_positions<P: AsRef<Path>>(backup_file: collection::BackupFile<P>) -> anyhow::Result<()> {
-    let (fo, co) = create_folder_options();
+    let opt = create_collections_options()?;
     Collections::restore_positions(
         get_config().base_dirs.clone(),
-        co,
+        opt,
         get_config().collections_cache_dir.as_path(),
-        fo,
         backup_file,
     )
     .map_err(Error::new)
 }
 
-fn start_server(server_secret: Vec<u8>, collections: Arc<Collections>) -> tokio::runtime::Runtime {
+fn build_runtime() -> tokio::runtime::Runtime {
+    let cfg = get_config();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(cfg.thread_pool.num_threads as usize)
+        .max_blocking_threads(cfg.thread_pool.queue_size as usize)
+        .build()
+        .unwrap()
+}
+
+fn start_server(
+    rt: &tokio::runtime::Runtime,
+    server_secret: Vec<u8>,
+    collections: Arc<Collections>,
+) -> (oneshot::Receiver<()>, watch::Sender<()>) {
     let cfg = get_config();
 
     let addr = cfg.listen;
+    let (stop_service_sender, stop_service_receiver) = watch::channel(());
     let start_server = async move {
         let authenticator = get_config().shared_secret.as_ref().map(|secret| {
-            SharedSecretAuthenticator::new(secret.clone(), server_secret, cfg.token_validity_hours)
+            SharedSecretAuthenticator::new(secret.clone(), &server_secret, cfg.token_validity_hours)
         });
+        let path_signing = SignedUrlService::new(server_secret, 5 * 60);
         let transcoding = TranscodingDetails {
             transcodings: Arc::new(AtomicUsize::new(0)),
             max_transcodings: cfg.transcoding.max_parallel_processes,
@@ -151,67 +175,44 @@ fn start_server(server_secret: Vec<u8>, collections: Arc<Collections>) -> tokio:
             Search::new(Some(collections.clone())),
             transcoding,
             collections,
+            path_signing,
             cfg.limit_rate,
+            stop_service_receiver,
         );
+        // TODO : handle file UTF8 errors
+        #[cfg(feature = "tls")]
+        let tls_config = get_config().ssl.as_ref().map(|ssl| TlsConfig {
+            cert_file: ssl.cert_file.to_str().unwrap().to_string(),
+            key_file: ssl.key_file.to_str().unwrap().to_string(),
+        });
+        #[cfg(not(feature = "tls"))]
+        let tls_config = None;
 
-        let server: Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> =
-            match get_config().ssl.as_ref() {
-                None => {
-                    let server = HttpServer::bind(&addr).serve(make_service_fn(
-                        move |conn: &hyper::server::conn::AddrStream| {
-                            let remote_addr = conn.remote_addr();
-                            svc_factory.create(Some(remote_addr), false)
-                        },
-                    ));
-                    info!("Server listening on {}{}", &addr, get_url_path!());
-                    Box::pin(server.map_err(|e| e.into()))
-                }
-                Some(ssl) => {
-                    #[cfg(feature = "tls")]
-                    {
-                        use tokio::net::TcpStream;
-                        use tokio_native_tls::TlsStream;
-                        info!("Server listening on {}{} with TLS", &addr, get_url_path!());
-                        let create_server = async move {
-                            let incoming = tls::tls_acceptor(&addr, &ssl)
-                                .await
-                                .context("TLS handshake")?;
-                            let server = HttpServer::builder(incoming)
-                                .serve(make_service_fn(move |conn: &TlsStream<TcpStream>| {
-                                    let remote_addr =
-                                        conn.get_ref().get_ref().get_ref().peer_addr().ok();
-                                    svc_factory.create(remote_addr, true)
-                                }))
-                                .await;
-
-                            server.map_err(|e| e.into())
-                        };
-
-                        Box::pin(create_server)
-                    }
-
-                    #[cfg(not(feature = "tls"))]
-                    {
-                        panic!(
-                            "TLS is not compiled - build with default features {:?}",
-                            ssl
-                        )
-                    }
-                }
-            };
+        let server: Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> = {
+            let is_tls = tls_config.is_some();
+            let server = HttpServer::bind(addr).serve(svc_factory, tls_config);
+            info!(
+                "Server listening on {}{}{}",
+                addr,
+                get_url_path!(),
+                if is_tls { " with TLS" } else { "" }
+            );
+            Box::pin(server)
+        };
 
         server.await
     };
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(cfg.thread_pool.num_threads as usize)
-        .max_blocking_threads(cfg.thread_pool.queue_size as usize)
-        .build()
-        .unwrap();
-
-    rt.spawn(start_server.map_err(|e| error!("Http Server Error: {}", e)));
-    rt
+    let (term_sender, term_receiver) = oneshot::channel();
+    rt.spawn(
+        start_server
+            .map_err(|e| error!("Http Server Error: {}", e))
+            .then(move |_| {
+                term_sender.send(()).ok();
+                futures::future::ready(())
+            }),
+    );
+    (term_receiver, stop_service_sender)
 }
 
 #[cfg(not(unix))]
@@ -221,16 +222,35 @@ async fn terminate_server() {
 }
 
 #[cfg(unix)]
-async fn terminate_server() {
+async fn terminate_server(
+    term_receiver: oneshot::Receiver<()>,
+    stop_service_sender: watch::Sender<()>,
+) {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut sigint = signal(SignalKind::interrupt()).expect("Cannot create SIGINT handler");
-    let mut sigterm = signal(SignalKind::terminate()).expect("Cannot create SIGTERM handler");
-    let mut sigquit = signal(SignalKind::quit()).expect("Cannot create SIGQUIT handler");
+    const SIGINT: SignalKind = SignalKind::interrupt();
+    const SIGTERM: SignalKind = SignalKind::terminate();
+    const SIGQUIT: SignalKind = SignalKind::quit();
+
+    let mut sigint = signal(SIGINT).expect("Cannot create SIGINT handler");
+    let mut sigterm = signal(SIGTERM).expect("Cannot create SIGTERM handler");
+    let mut sigquit = signal(SIGQUIT).expect("Cannot create SIGQUIT handler");
+
+    let terminate_on_signal = move |signal: SignalKind| {
+        let signal_name = match signal {
+            SIGINT => "SIGINT",
+            SIGTERM => "SIGTERM",
+            SIGQUIT => "SIGQUIT",
+            _ => "Other",
+        };
+        info!("Terminated on {}", signal_name);
+        stop_service_sender.send(()).ok();
+    };
 
     tokio::select!(
-        _ = sigint.recv() => {info!("Terminated on SIGINT")},
-        _ = sigterm.recv() => {info!("Terminated on SIGTERM")},
-        _ = sigquit.recv() => {info!("Terminated on SIGQUIT")}
+        _ = sigint.recv() => terminate_on_signal(SIGINT),
+        _ = sigterm.recv() => terminate_on_signal(SIGTERM),
+        _ = sigquit.recv() => terminate_on_signal(SIGQUIT),
+        _ = term_receiver => {warn!("Terminated because HTTP server finished unexpectedly")}
     )
 }
 
@@ -287,7 +307,7 @@ async fn watch_for_positions_backup_signal(cols: Arc<Collections>) {
 fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
-        if nix::unistd::getuid().is_root() {
+        if nix::unistd::geteuid().is_root() {
             warn!("Audioserve is running as root! Not recommended.")
         }
     }
@@ -295,7 +315,16 @@ fn main() -> anyhow::Result<()> {
         return Err(Error::msg(format!("Config/Arguments error: {}", e)));
     };
     env_logger::init();
-    debug!("Started with following config {:?}", get_config());
+    info!(
+        "Started audioserve {} with features {}",
+        config::LONG_VERSION,
+        config::FEATURES
+    );
+    if log_enabled!(log::Level::Debug) {
+        let mut cfg = get_config().clone();
+        cfg.shared_secret = cfg.shared_secret.map(|_| "******".to_string()); // Do not want to write secret to log!
+        debug!("Started with following config {:?}", cfg);
+    }
 
     collection::init_media_lib();
 
@@ -346,9 +375,10 @@ fn main() -> anyhow::Result<()> {
         Err(e) => return Err(Error::msg(format!("Error creating/reading secret: {}", e))),
     };
 
-    let collections = create_collections();
-
-    let runtime = start_server(server_secret, collections.clone());
+    let collections = create_collections()?;
+    let runtime = build_runtime();
+    let (term_receiver, stop_service_sender) =
+        start_server(&runtime, server_secret, collections.clone());
 
     #[cfg(unix)]
     {
@@ -357,9 +387,9 @@ fn main() -> anyhow::Result<()> {
         runtime.spawn(watch_for_positions_backup_signal(collections.clone()));
     }
 
-    runtime.block_on(terminate_server());
+    runtime.block_on(terminate_server(term_receiver, stop_service_sender));
 
-    //graceful shutdown of server will wait till transcoding ends, so rather shut it down hard
+    //graceful shutdown of server will wait till immediate tasks ends, so rather shut it down hard
     runtime.shutdown_timeout(std::time::Duration::from_millis(300));
 
     thread::spawn(|| {
@@ -392,6 +422,12 @@ fn main() -> anyhow::Result<()> {
             if let Err(e) = get_cache().save_index_blocking() {
                 error!("Error saving transcoding cache index {}", e);
             }
+        }
+    }
+
+    if !get_config().icons.cache_disabled {
+        if let Err(e) = crate::services::icon::cache::get_cache().save_index() {
+            error!("Error saving icons cache index {}", e);
         }
     }
 

@@ -7,21 +7,22 @@ use crate::{
     audio_folder::FolderLister,
     audio_meta::{AudioFolder, FolderByModification, TimeStamp},
     cache::update::{filter_event, FilteredEvent, RecursiveUpdater},
-    common::{CollectionTrait, PositionsData, PositionsTrait},
+    common::{CollectionOptions, CollectionTrait, PositionsData, PositionsTrait},
     error::{Error, Result},
-    position::{Position, PositionShort},
-    util::get_modified,
+    position::{Position, PositionShort, PositionsCollector},
+    util::{get_modified, spawn_named_thread},
     AudioFolderShort, FoldersOrdering,
 };
 use crossbeam_channel::{unbounded as channel, Receiver, Sender};
-use notify::{watcher, DebouncedEvent, Watcher};
+use notify::{recommended_watcher, Event, Watcher};
 use std::{
     collections::BinaryHeap,
     convert::TryInto,
+    fs::File,
+    io,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     thread,
-    time::Duration,
 };
 
 mod inner;
@@ -29,46 +30,100 @@ mod update;
 mod util;
 
 pub struct CollectionCache {
-    thread_loop: Option<thread::JoinHandle<()>>,
-    watcher_sender: Arc<Mutex<Option<std::sync::mpsc::Sender<DebouncedEvent>>>>,
-    thread_updater: Option<thread::JoinHandle<()>>,
+    thread_rescan: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+    thread_events: Option<thread::JoinHandle<()>>,
+    thread_updates: Option<thread::JoinHandle<()>>,
     cond: Arc<(Condvar, Mutex<bool>)>,
     pub(crate) inner: Arc<CacheInner>,
-    update_sender: Sender<Option<UpdateAction>>,
-    update_receiver: Option<Receiver<Option<UpdateAction>>>,
-    force_update: bool,
+    event_sender: Option<Sender<Option<Event>>>,
+    update_sender: Option<Sender<Option<UpdateAction>>>,
+    pub full_initial_update_required: bool,
+    pub is_initialized: bool,
+    notify_watcher: Arc<Mutex<Option<notify::RecommendedWatcher>>>,
+    pub watch_for_changes: bool,
+    pub changes_debounce_interval: u32,
 }
 
 impl CollectionCache {
     pub fn new<P1: Into<PathBuf>, P2: AsRef<Path>>(
         path: P1,
         db_dir: P2,
-        lister: FolderLister,
-        force_update: bool,
+        opt: CollectionOptions,
     ) -> Result<CollectionCache> {
         let root_path = path.into();
         let db_path = CollectionCache::db_path(&root_path, &db_dir)?;
+        let mut force_update = opt.force_cache_update_on_init && !opt.passive_init;
+
+        if !opt.passive_init {
+            let mut options_file = db_path.clone();
+            options_file.set_extension("options.json");
+
+            let save_options = || match File::create(&options_file) {
+                Ok(f) => match serde_json::to_writer(f, &opt) {
+                    Ok(_) => debug!("Created options file {:?}", options_file),
+                    Err(e) => error!("Cannot create {:?} : {}", options_file, e),
+                },
+                Err(e) => error!("Cannot create {:?} : {}", options_file, e),
+            };
+            match File::open(&options_file).and_then(|f| {
+                serde_json::from_reader::<_, CollectionOptions>(f).map_err(io::Error::other)
+            }) {
+                Ok(prev_options) => {
+                    if prev_options != opt {
+                        info!(
+                        "Previous folder options differ on {:?}, lets enforce full cache update",
+                        root_path
+                    );
+                        force_update = true;
+                        save_options();
+                    }
+                }
+                Err(e) => {
+                    warn!("Cannot read previous folder options on {:?} due to {}, will enforce full cache update", root_path, e);
+                    force_update = true;
+                    save_options();
+                }
+            }
+        }
+
         let db = sled::Config::default()
             .path(&db_path)
             .use_compression(true)
             .flush_every_ms(Some(10_000))
             .cache_capacity(100 * 1024 * 1024)
             .open()?;
-        let (update_sender, update_receiver) = channel::<Option<UpdateAction>>();
+        let (update_sender, update_receiver) = if opt.watch_for_changes {
+            let (s, r) = channel();
+            (Some(s), Some(r))
+        } else {
+            (None, None)
+        };
+
+        let time_to_end_of_folder = opt.time_to_end_of_folder;
         Ok(CollectionCache {
+            watch_for_changes: opt.watch_for_changes,
+            changes_debounce_interval: opt.changes_debounce_interval,
             inner: Arc::new(CacheInner::new(
                 db,
-                lister,
+                FolderLister::new_with_options(opt.into()),
                 root_path,
-                update_sender.clone(),
+                time_to_end_of_folder,
+                update_receiver,
             )?),
-            thread_loop: None,
-            watcher_sender: Arc::new(Mutex::new(None)),
-            thread_updater: None,
-            cond: Arc::new((Condvar::new(), Mutex::new(false))),
+            thread_rescan: Arc::new(Mutex::new(None)),
+            thread_events: None,
+            thread_updates: None,
+            cond: Arc::new((
+                Condvar::new(),
+                #[allow(clippy::mutex_atomic)]
+                // Not sure why clippy warns, as this is taken from example cor condition in std doc
+                Mutex::new(false),
+            )),
+            event_sender: None,
             update_sender,
-            update_receiver: Some(update_receiver),
-            force_update,
+            full_initial_update_required: force_update,
+            is_initialized: false,
+            notify_watcher: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -83,18 +138,18 @@ impl CollectionCache {
         let name = p
             .file_name()
             .map(|name| name.to_string_lossy() + "_" + name_prefix.as_ref())
-            .ok_or_else(|| Error::InvalidCollectionPath)?;
+            .ok_or(Error::InvalidCollectionPath)?;
         Ok(db_dir.as_ref().join(name.as_ref()))
     }
 
     pub(crate) fn restore_positions<P1: Into<PathBuf>, P2: AsRef<Path>>(
         path: P1,
         db_dir: P2,
-        lister: FolderLister,
-        force_update: bool,
+        opt: CollectionOptions,
         backup_data: PositionsData,
     ) -> Result<thread::JoinHandle<()>> {
-        let col = CollectionCache::new(path, db_dir, lister, force_update)?;
+        let force_update = opt.force_cache_update_on_init;
+        let col = CollectionCache::new(path, db_dir, opt)?;
         let inner = col.inner.clone();
         let thread = thread::spawn(move || {
             // clean up non-exitent directories
@@ -115,97 +170,131 @@ impl CollectionCache {
         Ok(thread)
     }
 
-    pub(crate) fn run_update_loop(&mut self) {
-        let update_receiver = self.update_receiver.take().expect("run multiple times");
-        let inner = self.inner.clone();
-        let ongoing_updater = OngoingUpdater::new(update_receiver, inner.clone());
-        self.thread_updater = Some(thread::spawn(move || ongoing_updater.run()));
+    pub fn init(mut self) -> Self {
+        let thread = self.start_recursive_update(self.full_initial_update_required);
+        *self.thread_rescan.lock().unwrap() = Some(thread);
+        if self.watch_for_changes {
+            self.start_update_threads();
+        }
+        self.is_initialized = true;
+        self
+    }
+
+    /// can run only once!
+    pub(crate) fn start_recursive_update(&self, force_update: bool) -> thread::JoinHandle<()> {
         let cond = self.cond.clone();
-        let mut force_update = self.force_update;
-        let watcher_sender = self.watcher_sender.clone();
-
-        let thread = thread::spawn(move || {
-            let root_path = inner.base_dir();
-            loop {
-                let (cond_var, cond_mtx) = &*cond;
-                {
-                    let mut started = cond_mtx.lock().unwrap();
-                    *started = false;
-                }
-                // Not ready to receive reload signals until scan is done
-                {
-                    let mut ws = watcher_sender.lock().unwrap();
-                    *ws = None;
-                }
-                let (tx, rx) = std::sync::mpsc::channel();
-
-                let mut watcher = watcher(tx.clone(), Duration::from_secs(1))
-                    .map_err(|e| error!("Failed to create fs watcher: {}", e));
-                if let Ok(ref mut watcher) = watcher {
-                    watcher
-                        .watch(&root_path, notify::RecursiveMode::Recursive)
-                        .map_err(|e| error!("failed to start watching: {}", e))
-                        .ok();
-                }
-
-                // clean up non-exitent directories
-                inner.clean_up_folders();
-
-                // inittial scan of directory
-                let updater = RecursiveUpdater::new(&inner, None, force_update);
-                updater.process();
-                force_update = false;
-
-                // clean up positions for non existent folders
-                inner.clean_up_positions();
-
-                // Notify about finish of initial scan
-                {
-                    let mut started = cond_mtx.lock().unwrap();
-                    *started = true;
-                    cond_var.notify_all();
-                }
-                // And can wait for rescan signal
-                {
-                    let mut ws = watcher_sender.lock().unwrap();
-                    *ws = Some(tx);
-                }
-
-                info!(
-                    "Initial scan for collection {:?} finished",
-                    inner.base_dir()
-                );
-
-                // now update changed directories
-                loop {
-                    match rx.recv() {
-                        Ok(event) => {
-                            trace!("Change in collection {:?} => {:?}", root_path, event);
-                            let interesting_event = match filter_event(event) {
-                                FilteredEvent::Ignore => continue,
-                                FilteredEvent::Pass(evt) => evt,
-                                FilteredEvent::Rescan => {
-                                    info!("Rescaning of collection required");
-                                    force_update = true;
-                                    break;
-                                }
-                                FilteredEvent::Error(e, p) => {
-                                    error!("Watch event error {} on {:?}", e, p);
-                                    continue;
-                                }
-                            };
-                            inner.proceed_event(interesting_event)
-                        }
-                        Err(e) => {
-                            error!("Error in collection watcher channel: {}", e);
-                            thread::sleep(Duration::from_secs(10));
-                            break;
-                        }
-                    }
-                }
+        let inner = self.inner.clone();
+        let thread_rescan = self.thread_rescan.clone();
+        let thread = spawn_named_thread("collection-rescan", move || {
+            let (cond_var, cond_mtx) = &*cond;
+            {
+                let mut started = cond_mtx.lock().unwrap();
+                *started = false;
             }
+
+            // clean up non-exitent directories
+            inner.clean_up_folders();
+
+            // initial scan of directory
+            let updater = RecursiveUpdater::new(&inner, None, force_update);
+            updater.process();
+
+            // clean up positions for non existent folders
+            inner.clean_up_positions();
+
+            // Notify about finish of initial scan
+            {
+                let mut started = cond_mtx.lock().unwrap();
+                *started = true;
+                cond_var.notify_all();
+            }
+
+            info!(
+                "{} scan for collection {:?} finished",
+                if force_update { "Full" } else { "Quick" },
+                inner.base_dir()
+            );
+
+            *thread_rescan.lock().unwrap() = None;
         });
-        self.thread_loop = Some(thread);
+        thread
+    }
+
+    pub(crate) fn start_notify_watcher(&mut self) -> Receiver<Option<Event>> {
+        let (event_sender, event_receiver) = channel::<Option<Event>>();
+        self.event_sender = Some(event_sender.clone());
+        let root_path = self.inner.base_dir().to_owned();
+        let event_passing_fn = move |event: std::result::Result<Event, notify::Error>| {
+            trace!("Change in collection {:?} => {:?}", root_path, event);
+            let interesting_event = match filter_event(event) {
+                FilteredEvent::Pass(evt) => evt,
+                FilteredEvent::Rescan => {
+                    info!("Rescaning of collection required");
+                    return;
+                }
+                FilteredEvent::Error(e, p) => {
+                    error!("Watch event error {} on {:?}", e, p);
+                    return;
+                }
+                FilteredEvent::Ignore => return,
+            };
+            if let Err(e) = event_sender.send(Some(interesting_event)) {
+                error!(
+                    "Channel to event debouncer is broken ({}), will stop thread",
+                    e
+                );
+            }
+        };
+
+        let watcher = recommended_watcher(event_passing_fn)
+            .map_err(|e| error!("Failed to create fs watcher: {}", e));
+        match watcher {
+            Ok(mut watcher) => {
+                // Recursive watch setup walks the entire tree (readdir + inotify_add_watch
+                // per directory), which can take many seconds to minutes on large or
+                // cold-cache filesystems (notably ZFS). Run it in a background thread so
+                // collection init returns immediately and the server can start listening.
+                // Until the watch is armed, fs changes won't be observed; the initial
+                // recursive scan that runs in parallel covers any state up to that point.
+                let base_dir = self.inner.base_dir().to_owned();
+                let notify_watcher = self.notify_watcher.clone();
+                spawn_named_thread("collection-watch-setup", move || {
+                    let t0 = std::time::Instant::now();
+                    if let Err(e) = watcher.watch(&base_dir, notify::RecursiveMode::Recursive) {
+                        error!("failed to start watching {:?}: {}", base_dir, e);
+                        return;
+                    }
+                    debug!(
+                        "Recursive watch armed for {:?} after {:?}",
+                        base_dir,
+                        t0.elapsed()
+                    );
+                    *notify_watcher.lock().unwrap() = Some(watcher);
+                });
+            }
+            Err(_) => {
+                error!("Failed to create fs watcher, collection changes won't be observed",);
+            }
+        }
+        event_receiver
+    }
+
+    /// can run only once!
+    pub(crate) fn start_update_threads(&mut self) {
+        let event_receiver = self.start_notify_watcher();
+        let ongoing_updater = OngoingUpdater::new(
+            event_receiver,
+            self.update_sender.take().unwrap(),
+            self.inner.clone(),
+            self.changes_debounce_interval,
+        );
+        self.thread_events = Some(spawn_named_thread("collection-events", || {
+            ongoing_updater.run_event_loop()
+        }));
+        let inner = self.inner.clone();
+        self.thread_updates = Some(spawn_named_thread("collection_updates", || {
+            inner.run_update_loop()
+        }));
     }
 
     #[allow(dead_code)]
@@ -241,7 +330,7 @@ impl CollectionTrait for CollectionCache {
         self.inner
             .get_if_actual(dir_path, ts)
             .map(|mut af| {
-                if matches!(ordering, FoldersOrdering::RecentFirst) {
+                if !matches!(ordering, FoldersOrdering::Alphabetical) {
                     af.subfolders
                         .sort_unstable_by(|a, b| a.compare_as(ordering, b));
                 }
@@ -257,7 +346,7 @@ impl CollectionTrait for CollectionCache {
                         // We should update cache as we got new info
                         debug!("Updating cache for dir {:?}", full_path);
                         let mut af = af_ref.clone();
-                        if matches!(ordering, FoldersOrdering::RecentFirst) {
+                        if !matches!(ordering, FoldersOrdering::Alphabetical) {
                             af.subfolders.sort_unstable_by(|a, b| {
                                 a.compare_as(FoldersOrdering::Alphabetical, b)
                             });
@@ -299,11 +388,16 @@ impl CollectionTrait for CollectionCache {
             })
     }
 
+    fn get_folder_cover_path(&self, dir_path: impl AsRef<Path>) -> Result<Option<PathBuf>> {
+        Ok(self.get(dir_path).and_then(|af| af.cover).map(|f| f.path))
+        // TODO: Rescaning folder if not cached?
+    }
+
     fn flush(&self) -> Result<()> {
         self.inner.flush()
     }
 
-    fn search<S: AsRef<str>>(&self, q: S) -> Vec<AudioFolderShort> {
+    fn search<S: AsRef<str>>(&self, q: S, group: Option<String>) -> Vec<AudioFolderShort> {
         let tokens: Vec<String> = q
             .as_ref()
             .split_whitespace()
@@ -315,11 +409,13 @@ impl CollectionTrait for CollectionCache {
             tokens,
             iter,
             prev_match: None,
+            group,
+            inner: self.inner.clone(),
         };
         search.collect()
     }
 
-    fn recent(&self, limit: usize) -> Vec<AudioFolderShort> {
+    fn recent(&self, limit: usize, group: Option<String>) -> Vec<AudioFolderShort> {
         let mut heap = BinaryHeap::with_capacity(limit + 1);
 
         for (key, val) in self.inner.iter_folders().skip(1).filter_map(|r| r.ok()) {
@@ -329,16 +425,29 @@ impl CollectionTrait for CollectionCache {
                 heap.pop();
             }
         }
-        heap.into_sorted_vec()
+        let mut result: Vec<_> = heap
+            .into_sorted_vec()
             .into_iter()
             .map(|i| i.into())
-            .collect()
+            .collect();
+        if let Some(ref group) = group {
+            result
+                .iter_mut()
+                .for_each(|sf| self.inner.update_subfolder(group, sf));
+        }
+
+        result
     }
 
     fn signal_rescan(&self) {
-        if let Ok(tx) = self.watcher_sender.lock() {
-            tx.as_ref()
-                .and_then(|tx| tx.send(DebouncedEvent::Rescan).ok());
+        debug!("Required rescan on collection {:?}", self.base_dir());
+        let mut running = self.thread_rescan.lock().unwrap();
+        match *running {
+            Some(_) => warn!("Rescan is still running, cannot start another"),
+            None => {
+                let thread = self.start_recursive_update(true);
+                *running = Some(thread);
+            }
         }
     }
 
@@ -349,12 +458,20 @@ impl CollectionTrait for CollectionCache {
 
 impl Drop for CollectionCache {
     fn drop(&mut self) {
-        self.update_sender.send(None).ok();
-        if let Some(t) = self.thread_updater.take() {
+        self.event_sender.as_ref().and_then(|s| s.send(None).ok());
+        // Drop watcher early - just to be sure
+        self.notify_watcher.lock().unwrap().take();
+        if let Some(t) = self.thread_events.take() {
+            t.join().ok();
+            debug!("Events thread joined");
+        } else if self.watch_for_changes {
+            warn!("Join handle is missing for events thread")
+        }
+        if let Some(t) = self.thread_updates.take() {
             t.join().ok();
             debug!("Update thread joined");
-        } else {
-            warn!("Join handle is missing");
+        } else if self.watch_for_changes {
+            warn!("Join handle is missing for update thread");
         }
         self.inner
             .flush()
@@ -365,6 +482,14 @@ impl Drop for CollectionCache {
 
 // positions
 impl PositionsTrait for CollectionCache {
+    fn mark_as_finished<P, S>(&self, group: S, path: P, ts: Option<TimeStamp>) -> Result<()>
+    where
+        S: AsRef<str>,
+        P: AsRef<str>,
+    {
+        self.inner.mark_as_finished(group, path, ts)
+    }
+
     fn insert_position<S, P>(
         &self,
         group: S,
@@ -389,11 +514,16 @@ impl PositionsTrait for CollectionCache {
         self.inner.get_position(group, folder)
     }
 
-    fn get_all_positions_for_group<S>(&self, group: S, collection_no: usize) -> Vec<Position>
-    where
+    fn get_all_positions_for_group<S>(
+        &self,
+        group: S,
+        collection_no: usize,
+        res: &mut PositionsCollector,
+    ) where
         S: AsRef<str>,
     {
-        self.inner.get_all_positions_for_group(group, collection_no)
+        self.inner
+            .get_all_positions_for_group(group, collection_no, res)
     }
 
     fn write_json_positions<F: std::io::Write>(&self, file: &mut F) -> Result<()> {
@@ -409,35 +539,49 @@ impl PositionsTrait for CollectionCache {
         group: S,
         folder: P,
         collection_no: usize,
-    ) -> Vec<Position>
-    where
+        res: &mut PositionsCollector,
+    ) where
         S: AsRef<str>,
         P: AsRef<str>,
     {
         self.inner
-            .get_positions_recursive(group, folder, collection_no)
+            .get_positions_recursive(group, folder, collection_no, res)
+    }
+}
+
+impl CollectionCache {
+    pub fn list_keys(&self) -> impl Iterator<Item = String> {
+        self.inner.iter_folders().filter_map(|i| {
+            i.ok()
+                .and_then(|(k, _v)| String::from_utf8(k.as_ref().to_owned()).ok())
+        })
     }
 }
 
 pub struct Search {
     tokens: Vec<String>,
     iter: sled::Iter,
-    prev_match: Option<String>,
+    prev_match: Option<Vec<String>>,
+    group: Option<String>,
+    inner: Arc<CacheInner>,
 }
 
 impl Iterator for Search {
     type Item = AudioFolderShort;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(item) = self.iter.next() {
+        for item in &mut self.iter {
             match item {
                 Ok((key, val)) => {
                     let path = std::str::from_utf8(key.as_ref()).unwrap(); // we can safely unwrap as we inserted string
                     if self
                         .prev_match
                         .as_ref()
-                        .and_then(|m| path.strip_prefix(m))
-                        .map(|s| s.contains(std::path::MAIN_SEPARATOR)) // only match was parent path
+                        .map(|v| {
+                            v.iter()
+                                .filter_map(|prev| path.strip_prefix(prev))
+                                .any(|s| s.contains(std::path::MAIN_SEPARATOR))
+                        })
                         .unwrap_or(false)
                     {
                         continue;
@@ -445,8 +589,25 @@ impl Iterator for Search {
                     let path_lower_case = path.to_lowercase();
                     let is_match = self.tokens.iter().all(|t| path_lower_case.contains(t));
                     if is_match {
-                        self.prev_match = Some(path.to_owned());
-                        return Some(kv_to_audiofolder(path, val));
+                        self.prev_match = self
+                            .prev_match
+                            .take()
+                            .map(|mut v| {
+                                v.push(path.to_owned());
+                                //this is just a size fuse, we do not want too big vec, rather tolerate too detailed and slower search
+                                if v.len() > 100 {
+                                    v.remove(0);
+                                }
+                                v
+                            })
+                            .or_else(|| Some(vec![path.to_owned()])); //Some(path.to_owned());
+                        let mut sf = kv_to_audiofolder(path, val);
+                        if let Some(ref group) = self.group {
+                            self.inner.update_subfolder(group, &mut sf);
+                        }
+                        return Some(sf);
+                    } else {
+                        self.prev_match = None
                     }
                 }
                 Err(e) => error!("Error iterating collection db: {}", e),
@@ -462,24 +623,25 @@ mod tests {
     use std::{
         fs::{self, File},
         io::{Read, Write},
-        time::SystemTime,
+        time::{Duration, SystemTime},
     };
 
     use fs_extra::dir::{copy, CopyOptions};
     use serde_json::Value;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     use crate::position::PositionItem;
 
     use super::*;
 
     fn create_tmp_collection() -> (CollectionCache, TempDir) {
-        let tmp_dir = TempDir::new("AS_CACHE_TEST").expect("Cannot create temp dir");
+        let tmp_dir = TempDir::with_prefix("AS_CACHE_TEST").expect("Cannot create temp dir");
         let test_data_dir = Path::new("../../test_data");
         let db_path = tmp_dir.path().join("updater_db");
-        let mut col = CollectionCache::new(test_data_dir, db_path, FolderLister::new(), false)
+        fs::create_dir(&db_path).ok();
+        let col = CollectionCache::new(test_data_dir, db_path, CollectionOptions::default())
             .expect("Cannot create CollectionCache");
-        col.run_update_loop();
+        col.start_recursive_update(true);
         col.wait_until_inital_scan_is_done();
         (col, tmp_dir)
     }
@@ -493,7 +655,7 @@ mod tests {
         let entry2 = col.get("usak/kulisak").unwrap();
         assert_eq!(2, entry1.files.len());
         assert_eq!(2, entry1.subfolders.len());
-        assert_eq!(0, entry2.files.len());
+        assert_eq!(1, entry2.files.len());
 
         let entry3 = col.get("01-file.mp3").unwrap();
         assert_eq!(3, entry3.files.len());
@@ -503,14 +665,15 @@ mod tests {
     #[test]
     fn test_cache_manipulation() -> anyhow::Result<()> {
         env_logger::try_init().ok();
-        let tmp_dir = TempDir::new("AS_CACHE_TEST")?;
+        let tmp_dir = TempDir::with_prefix("AS_CACHE_TEST")?;
         let test_data_dir_orig = Path::new("../../test_data");
         let test_data_dir = tmp_dir.path().join("test_data");
-        copy(&test_data_dir_orig, tmp_dir.path(), &CopyOptions::default())?;
+        copy(test_data_dir_orig, tmp_dir.path(), &CopyOptions::default())?;
         let info_file = test_data_dir.join("usak/kulisak/desc.txt");
         assert!(info_file.exists());
         let db_path = tmp_dir.path().join("updater_db");
-        let col = CollectionCache::new(&test_data_dir, db_path, FolderLister::new(), false)
+        fs::create_dir(&db_path).ok();
+        let col = CollectionCache::new(&test_data_dir, db_path, CollectionOptions::default())
             .expect("Cannot create CollectionCache");
 
         col.force_update("usak/kulisak")?;
@@ -520,6 +683,8 @@ mod tests {
             Path::new("usak/kulisak/desc.txt"),
             af.description.unwrap().path
         );
+        // wait a bit before renaming, so mtime is different
+        thread::sleep(Duration::from_millis(10));
         let new_info_name = test_data_dir.join("usak/kulisak/info.txt");
         fs::rename(info_file, new_info_name)?;
         let af2 = col.list_dir("usak/kulisak", FoldersOrdering::RecentFirst, None)?;
@@ -576,7 +741,9 @@ mod tests {
         let (col2, _tmp2) = create_tmp_collection();
         assert!(col2.get_position::<_, String>("ivan", None).is_none());
         col2.read_json_positions(PositionsData::V1(json))?;
-        assert_eq!(2, col2.get_all_positions_for_group("ivan", 0).len());
+        let mut res = PositionsCollector::new(100);
+        col2.get_all_positions_for_group("ivan", 0, &mut res);
+        assert_eq!(2, res.into_vec().len());
         Ok(())
     }
 
@@ -594,7 +761,7 @@ mod tests {
     fn test_search() {
         env_logger::try_init().ok();
         let (col, _tmp_dir) = create_tmp_collection();
-        let res: Vec<_> = col.search("usak kulisak");
+        let res: Vec<_> = col.search("usak kulisak", None);
         assert_eq!(1, res.len());
         let af = &res[0];
         assert_eq!("kulisak", af.name.as_str());
@@ -603,7 +770,7 @@ mod tests {
         assert!(af.modified.is_some());
         assert!(!af.is_file);
 
-        let res: Vec<_> = col.search("neneneexistuje");
+        let res: Vec<_> = col.search("neneneexistuje", None);
         assert_eq!(0, res.len());
     }
 
@@ -666,14 +833,18 @@ mod tests {
         assert_eq!(r3.position, 0.08);
 
         // test listing all positions
-        let v = col.inner.get_all_positions_for_group("ivan", 0);
-        assert_eq!(2, v.len());
+        let mut res = PositionsCollector::new(10);
+        col.inner.get_all_positions_for_group("ivan", 0, &mut res);
+        assert_eq!(2, res.into_vec().len());
 
-        let v = col.inner.get_positions_recursive("ivan", "", 0);
-        assert_eq!(2, v.len());
+        let mut res = PositionsCollector::new(10);
+        col.inner.get_positions_recursive("ivan", "", 0, &mut res);
+        assert_eq!(2, res.into_vec().len());
 
-        let v = col.inner.get_positions_recursive("ivan", "01-file.mp3", 0);
-        assert_eq!(1, v.len());
+        let mut res = PositionsCollector::new(10);
+        col.inner
+            .get_positions_recursive("ivan", "01-file.mp3", 0, &mut res);
+        assert_eq!(1, res.into_vec().len());
         Ok(())
     }
 }

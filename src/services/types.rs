@@ -1,11 +1,12 @@
 use super::transcode::{QualityLevel, TranscodingFormat};
 use crate::config::get_config;
-
 use collection::{AudioFile, AudioFolderShort};
+use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 pub struct CollectionsInfo {
     pub version: &'static str,
+    pub commit: &'static str,
     pub folder_download: bool,
     pub shared_positions: bool,
     pub count: u32,
@@ -35,6 +36,12 @@ pub struct Transcodings {
     pub high: TranscodingSummary,
 }
 
+impl Default for Transcodings {
+    fn default() -> Self {
+        Transcodings::new()
+    }
+}
+
 impl Transcodings {
     pub fn new() -> Self {
         let cfg = get_config();
@@ -44,6 +51,27 @@ impl Transcodings {
             medium: cfg.transcoding.get(QualityLevel::Medium).into(),
             high: cfg.transcoding.get(QualityLevel::High).into(),
         }
+    }
+
+    pub fn for_user_agent(user_agent: &str) -> Self {
+        let alt_configs = get_config().transcoding.alt_configs();
+        if let Some(alt_configs) = alt_configs {
+            for (re, cfg) in alt_configs {
+                if re.is_match(user_agent) {
+                    debug!(
+                        "Using alternate transcoding {} config for User Agent {} ",
+                        re, user_agent
+                    );
+                    return Transcodings {
+                        max_transcodings: get_config().transcoding.max_parallel_processes,
+                        low: cfg.get(QualityLevel::Low).into(),
+                        medium: cfg.get(QualityLevel::Medium).into(),
+                        high: cfg.get(QualityLevel::High).into(),
+                    };
+                }
+            }
+        }
+        Transcodings::new()
     }
 }
 
@@ -101,6 +129,26 @@ mod download_format {
             } else {
                 DownloadFormat::Zip
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_download_format() {
+            assert_eq!(DownloadFormat::Tar.extension(), ".tar");
+            assert_eq!(DownloadFormat::Zip.extension(), ".zip");
+
+            let tar: DownloadFormat = "tar".parse().unwrap();
+            assert_eq!(tar, DownloadFormat::Tar);
+
+            let zip: DownloadFormat = "zip".parse().unwrap();
+            assert_eq!(zip, DownloadFormat::Zip);
+
+            assert!("xml".parse::<DownloadFormat>().is_err());
+            assert!("".parse::<DownloadFormat>().is_err());
         }
     }
 }

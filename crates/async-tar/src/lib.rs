@@ -71,7 +71,7 @@ enum TarState {
 pub fn calc_size<S: IntoIterator<Item = u64>>(sizes: S) -> u64 {
     sizes
         .into_iter()
-        .fold(1024, |total, sz| total + 512 + 512 * ((sz + 511) / 512))
+        .fold(1024, |total, sz| total + 512 + 512 * sz.div_ceil(512))
 }
 
 ///
@@ -319,6 +319,7 @@ impl<P: AsRef<Path> + Send> Stream for TarStream<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use futures::sink::SinkExt;
     use futures::stream::{StreamExt, TryStreamExt};
     use io::Result;
@@ -334,13 +335,12 @@ mod tests {
         let files = &["README.md", "Cargo.toml"];
         let sizes = files.iter().map(|f| Path::new(f).metadata().unwrap().len());
         let expected_archive_len = calc_size(sizes);
-        let tar_stream =
-            TarStream::tar_iter_rel(files.into_iter(), std::env::current_dir().unwrap());
+        let tar_stream = TarStream::tar_iter_rel(files.iter(), std::env::current_dir().unwrap());
         let tar_file = tokio_fs::File::create(tar_file_name).await?;
         let codec = tokio_util::codec::BytesCodec::new();
         let mut file_sink = codec.framed(tar_file);
         file_sink
-            .send_all(&mut tar_stream.map(|v| v.map(|x| x.into())))
+            .send_all(&mut tar_stream.map(|v| v.map(Bytes::from)))
             .await?;
 
         let archive_len = tar_file_name2.metadata().unwrap().len();
@@ -364,7 +364,7 @@ mod tests {
         let tar_file = tokio_fs::File::create(tar_file_name).await?;
         let codec = tokio_util::codec::BytesCodec::new();
         let mut file_sink = codec.framed(tar_file);
-        file_sink.send_all(&mut tar.map_ok(|v| v.into())).await?;
+        file_sink.send_all(&mut tar.map_ok(Bytes::from)).await?;
 
         check_archive(tar_file_name2, 2);
         temp_dir.close().unwrap();

@@ -1,10 +1,11 @@
 use self::codecs::*;
-use super::subs::ChunkStream;
 use crate::config::get_config;
 use crate::error::{bail, Result};
 use collection::TimeSpan;
 use futures::prelude::*;
 use mime::Mime;
+use myhy::response::ChunkStream;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::fmt::Debug;
@@ -32,8 +33,9 @@ pub trait AudioCodec {
     fn bitrate(&self) -> u32;
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")] //TODO: There is a problem in config consistency - here is kebab-case, elsewhere is snake_case
+#[serde(deny_unknown_fields)]
 pub enum TranscodingFormat {
     OpusInOgg(Opus),
     OpusInWebm(Opus),
@@ -104,25 +106,47 @@ impl TranscodingFormat {
         m.parse().unwrap()
     }
 }
+#[derive(Debug, Clone)]
+pub struct ChosenTranscoding {
+    pub format: TranscodingFormat,
+    pub level: QualityLevel,
+    #[allow(dead_code)]
+    pub tag: &'static str,
+}
 
-impl TranscodingFormat {
-    pub fn default_level(l: QualityLevel) -> Self {
-        match l {
-            QualityLevel::Low => {
-                TranscodingFormat::OpusInOgg(Opus::new(32, 5, Bandwidth::SuperWideBand, true))
+impl ChosenTranscoding {
+    pub fn passthough() -> Self {
+        Self {
+            format: TranscodingFormat::Remux,
+            level: QualityLevel::Passthrough,
+            tag: "",
+        }
+    }
+
+    pub fn for_level_and_user_agent(level: QualityLevel, user_agent: Option<&str>) -> Self {
+        let cfg = &get_config().transcoding;
+        if let Some(user_agent) = user_agent {
+            if let Some(alt_configs) = cfg.alt_configs() {
+                for (re, trans) in alt_configs {
+                    if re.is_match(user_agent) {
+                        return Self {
+                            format: trans.get(level),
+                            level,
+                            tag: trans.tag.as_str(),
+                        };
+                    }
+                }
             }
-            QualityLevel::Medium => {
-                TranscodingFormat::OpusInOgg(Opus::new(48, 8, Bandwidth::SuperWideBand, false))
-            }
-            QualityLevel::High => {
-                TranscodingFormat::OpusInOgg(Opus::new(64, 10, Bandwidth::FullBand, false))
-            }
-            QualityLevel::Passthrough => TranscodingFormat::Remux,
+        }
+        Self {
+            format: cfg.get(level),
+            level,
+            tag: "",
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Copy)]
+#[derive(Clone, Debug, PartialEq, Eq, Copy)]
 pub enum QualityLevel {
     Low,
     Medium,
@@ -173,30 +197,28 @@ impl<S> AsRef<S> for AudioFilePath<S> {
 
 #[derive(Clone, Debug)]
 pub struct Transcoder {
-    quality: TranscodingFormat,
+    quality: ChosenTranscoding,
 }
 
 #[cfg(feature = "transcoding-cache")]
 type TranscodedStream =
     Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>, std::io::Error>> + Send + Sync + 'static>>;
-#[cfg(feature = "transcoding-cache")]
-type TranscodedFuture = Pin<Box<dyn Future<Output = Result<TranscodedStream>> + Send>>;
 
 impl Transcoder {
-    pub fn new(quality: TranscodingFormat) -> Self {
+    pub fn new(quality: ChosenTranscoding) -> Self {
         Transcoder { quality }
     }
 
     fn base_ffmpeg(&self, seek: Option<f32>, span: Option<TimeSpan>) -> Command {
         let mut cmd = Command::new("ffmpeg");
-        cmd.args(&["-nostdin", "-v", "error"]);
+        cmd.args(["-nostdin", "-v", "error"]);
         let offset = span.as_ref().map(|s| s.start).unwrap_or(0) as f32;
         let time = span.and_then(|s| s.duration).unwrap_or(0);
         let seek = seek.unwrap_or(0f32);
-        let start = offset as f32 / 1000.0 + seek;
+        let start = offset / 1000.0 + seek;
 
         if start > 0.0 {
-            cmd.args(&["-accurate_seek", "-ss"]);
+            cmd.args(["-accurate_seek", "-ss"]);
             let time_spec = format!("{:3}", start);
             cmd.arg(time_spec);
         }
@@ -214,7 +236,7 @@ impl Transcoder {
     }
 
     fn input_file_args<S: AsRef<OsStr>>(&self, cmd: &mut Command, file: S) {
-        cmd.arg("-i").arg(file).args(&[
+        cmd.arg("-i").arg(file).args([
             "-y",
             "-map_metadata",
             "-1", // removing metadata as we do not need them
@@ -232,7 +254,7 @@ impl Transcoder {
         span: Option<TimeSpan>,
     ) -> Command {
         let mut cmd = self.base_ffmpeg(seek, span);
-        let targs = self.quality.args();
+        let targs = self.quality.format.args();
         self.input_file_args(&mut cmd, file);
         cmd.args(targs.codec_args)
             .args(targs.quality_args.iter().map(|i| i.as_ref()))
@@ -258,10 +280,10 @@ impl Transcoder {
         let fmt = if !use_transcoding_format {
             guess_format(file.as_ref()).ffmpeg
         } else {
-            self.quality.args().format
+            self.quality.format.args().format
         };
         self.input_file_args(&mut cmd, file);
-        cmd.args(&["-acodec", "copy"])
+        cmd.args(["-acodec", "copy"])
             .arg("-f")
             .arg(fmt)
             .arg("pipe:1")
@@ -274,13 +296,9 @@ impl Transcoder {
     pub fn transcoding_params(&self) -> String {
         format!(
             "codec={}; bitrate={}",
-            self.quality.format_name(),
-            self.quality.bitrate(),
+            self.quality.format.format_name(),
+            self.quality.format.bitrate(),
         )
-    }
-
-    pub fn transcoded_mime(&self) -> Mime {
-        self.quality.mime()
     }
 
     #[cfg(not(feature = "transcoding-cache"))]
@@ -290,7 +308,6 @@ impl Transcoder {
         seek: Option<f32>,
         span: Option<TimeSpan>,
         counter: super::Counter,
-        _quality: QualityLevel,
     ) -> impl Future<Output = Result<ChunkStream<ChildStdout>>> {
         future::ready(
             self.transcode_inner(file, seek, span, counter)
@@ -302,48 +319,46 @@ impl Transcoder {
     }
 
     #[cfg(feature = "transcoding-cache")]
-    pub fn transcode<S: AsRef<OsStr> + Debug + Send + 'static>(
+    pub async fn transcode<S: AsRef<OsStr> + Debug + Send + 'static>(
         self,
         file: AudioFilePath<S>,
         seek: Option<f32>,
         span: Option<TimeSpan>,
         counter: super::Counter,
-        quality: QualityLevel,
-    ) -> TranscodedFuture {
-        use self::cache::{cache_key, get_cache};
+    ) -> Result<TranscodedStream> {
+        use self::cache::get_cache;
         use futures::channel::mpsc;
         use std::io;
 
         let is_transcoded = matches!(file, AudioFilePath::Transcoded(_));
         if is_transcoded
             || seek.is_some()
-            || quality == QualityLevel::Passthrough
+            || self.quality.level == QualityLevel::Passthrough
             || get_config().transcoding.cache.disabled
         {
             debug!("Shoud not add to cache as is already transcoded, seeking, remuxing or cache is disabled");
-            return Box::pin(future::ready(
+            return self
+                .transcode_inner(file, seek, span, counter)
+                .map(|(stream, f)| {
+                    tokio::spawn(f);
+                    Box::pin(stream) as TranscodedStream
+                });
+        }
+
+        //TODO: this is ugly -  unify either we will use Path or OsStr!
+        let (key, meta) = cache::cache_key_async(file.as_ref().as_ref(), &self.quality, span)
+            .await
+            .map_err(|e| crate::error::Error::msg(format!("Cache key error: {}", e)))?;
+        match get_cache().add(key, meta.into()).await {
+            Err(e) => {
+                warn!("Cannot create cache entry: {}", e);
                 self.transcode_inner(file, seek, span, counter)
                     .map(|(stream, f)| {
                         tokio::spawn(f);
                         Box::pin(stream) as TranscodedStream
-                    }),
-            ));
-        }
-
-        //TODO: this is ugly -  unify either we will use Path or OsStr!
-        let key = cache_key(file.as_ref().as_ref(), quality, span);
-        let fut = get_cache().add(key).then(move |res| match res {
-            Err(e) => {
-                warn!("Cannot create cache entry: {}", e);
-                future::ready(
-                    self.transcode_inner(file, seek, span, counter)
-                        .map(|(stream, f)| {
-                            tokio::spawn(f);
-                            Box::pin(stream) as TranscodedStream
-                        }),
-                )
+                    })
             }
-            Ok((cache_file, cache_finish)) => future::ready(
+            Ok((cache_file, cache_finish)) => {
                 self.transcode_inner(file, seek, span, counter)
                     .map(|(mut stream, f)| {
                         tokio::spawn(f.then(|res| {
@@ -373,8 +388,7 @@ impl Transcoder {
                             self::vec_codec::VecEncoder,
                         );
                         let (tx, rx) = mpsc::channel(64);
-                        let mut tx = cache_sink
-                            .fanout(tx.sink_map_err(|e| io::Error::new(io::ErrorKind::Other, e)));
+                        let mut tx = cache_sink.fanout(tx.sink_map_err(io::Error::other));
                         let f = async move {
                             let done = tx.send_all(&mut stream).await;
                             if let Err(e) = done {
@@ -383,10 +397,9 @@ impl Transcoder {
                         };
                         tokio::spawn(f);
                         Box::pin(rx.map(Ok)) as TranscodedStream
-                    }),
-            ),
-        });
-        Box::pin(fut)
+                    })
+            }
+        }
     }
 
     fn transcode_inner<S: AsRef<OsStr> + Debug + Send + 'static>(
@@ -399,7 +412,7 @@ impl Transcoder {
         ChunkStream<ChildStdout>,
         impl Future<Output = Result<(), ()>>,
     )> {
-        let mut cmd = match (&file, &self.quality) {
+        let mut cmd = match (&file, &self.quality.format) {
             (_, TranscodingFormat::Remux) => {
                 self.build_remux_command(file.as_ref(), seek, span, false)
             }
@@ -424,7 +437,7 @@ impl Transcoder {
                         )
                         .await;
 
-                        counter.fetch_sub(1, Ordering::SeqCst);
+                        counter.fetch_sub(1, Ordering::Release);
                         match res {
                             Ok(res) => match res {
                                 Ok(res) => {
@@ -465,13 +478,13 @@ impl Transcoder {
                     };
                     Ok((stream, fut))
                 } else {
-                    counter.fetch_sub(1, Ordering::SeqCst);
+                    counter.fetch_sub(1, Ordering::Release);
                     error!("Cannot get child process stdout");
                     bail!("Cannot get child process stdout");
                 }
             }
             Err(e) => {
-                counter.fetch_sub(1, Ordering::SeqCst);
+                counter.fetch_sub(1, Ordering::Release);
                 error!("Cannot spawn child process: {:?}", e);
                 bail!("Cannot spawn child");
             }
@@ -535,7 +548,11 @@ mod tests {
         span: Option<TimeSpan>,
     ) {
         env_logger::try_init().ok();
-        let t = Transcoder::new(TranscodingFormat::default_level(QualityLevel::Low));
+        let t = Transcoder::new(ChosenTranscoding {
+            format: TranscodingFormat::OpusInOgg(Opus::new(32, 5, Bandwidth::SuperWideBand, true)),
+            level: QualityLevel::Medium,
+            tag: "test",
+        });
         let out_file = temp_dir().join(output_file);
         let mut cmd = match copy_file {
             None => t.build_command("./test_data/01-file.mp3", seek, span),
@@ -553,7 +570,7 @@ mod tests {
                 let mut out = child.stdout.take().unwrap();
                 tokio::io::copy(&mut out, &mut file)
                     .await
-                    .expect("file cope failed");
+                    .expect("file copy failed");
             }
             child.wait().await
         };
@@ -563,7 +580,11 @@ mod tests {
         assert!(out_file.exists());
 
         //TODO: for some reasons sometimes cannot get meta - but file is OK
-        let meta = get_audio_properties(&out_file).expect("Cannot get audio file meta");
+        #[cfg(feature = "tags-encoding")]
+        let meta = get_audio_properties(&out_file, None as Option<String>);
+        #[cfg(not(feature = "tags-encoding"))]
+        let meta = get_audio_properties(&out_file);
+        let meta = meta.expect("Cannot get audio file meta");
         let audio_len = if copy_file.is_some() { 1 } else { 2 };
         let dur = audio_len - seek.map(|s| s.round() as u32).unwrap_or(0);
 
@@ -624,5 +645,42 @@ mod tests {
             }),
         )
         .await;
+    }
+
+    #[test]
+    fn test_quality_level_roundtrip() {
+        assert_eq!(QualityLevel::from_letter(&"l"), Some(QualityLevel::Low));
+        assert_eq!(QualityLevel::from_letter(&"m"), Some(QualityLevel::Medium));
+        assert_eq!(QualityLevel::from_letter(&"h"), Some(QualityLevel::High));
+        assert_eq!(QualityLevel::from_letter(&"x"), None);
+        assert_eq!(QualityLevel::from_letter(&""), None);
+
+        assert_eq!(QualityLevel::Low.to_letter(), "l");
+        assert_eq!(QualityLevel::Medium.to_letter(), "m");
+        assert_eq!(QualityLevel::High.to_letter(), "h");
+        assert_eq!(QualityLevel::Passthrough.to_letter(), "p");
+    }
+
+    #[test]
+    fn test_transcoding_params_format() {
+        let t = Transcoder::new(ChosenTranscoding {
+            format: TranscodingFormat::OpusInOgg(Opus::new(48, 8, Bandwidth::SuperWideBand, false)),
+            level: QualityLevel::Medium,
+            tag: "test",
+        });
+        let params = t.transcoding_params();
+        assert!(params.contains("codec="), "params must contain 'codec='");
+        assert!(
+            params.contains("bitrate="),
+            "params must contain 'bitrate='"
+        );
+        assert!(
+            params.contains("48"),
+            "params must contain the bitrate value 48"
+        );
+        assert!(
+            params.contains("opus-in-ogg"),
+            "params must name the format"
+        );
     }
 }

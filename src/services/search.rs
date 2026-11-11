@@ -3,30 +3,40 @@ use collection::FoldersOrdering;
 use std::sync::Arc;
 
 pub trait SearchTrait<S> {
-    fn search(&self, collection: usize, query: S, ordering: FoldersOrdering) -> SearchResult;
-    fn recent(&self, collection: usize) -> SearchResult;
+    fn search(
+        &self,
+        collection: usize,
+        query: S,
+        ordering: FoldersOrdering,
+        group: Option<String>,
+    ) -> SearchResult;
+    fn recent(&self, collection: usize, group: Option<String>) -> SearchResult;
 }
 
 #[derive(Clone)]
 pub struct Search<S> {
-    inner: Arc<Box<dyn SearchTrait<S> + Send + Sync>>,
+    inner: Arc<dyn SearchTrait<S> + Send + Sync>,
 }
 
 impl<S: AsRef<str>> SearchTrait<S> for Search<S> {
-    fn search(&self, collection: usize, query: S, ordering: FoldersOrdering) -> SearchResult {
-        self.inner.search(collection, query, ordering)
+    fn search(
+        &self,
+        collection: usize,
+        query: S,
+        ordering: FoldersOrdering,
+        group: Option<String>,
+    ) -> SearchResult {
+        self.inner.search(collection, query, ordering, group)
     }
-    fn recent(&self, collection: usize) -> SearchResult {
-        self.inner.recent(collection)
+    fn recent(&self, collection: usize, group: Option<String>) -> SearchResult {
+        self.inner.recent(collection, group)
     }
 }
 
 impl<S: AsRef<str>> Search<S> {
     pub fn new(collections: Option<Arc<collection::Collections>>) -> Self {
         Search {
-            inner: Arc::new(Box::new(col_db::CollectionsSearch::new(
-                collections.unwrap(),
-            ))),
+            inner: Arc::new(col_db::CollectionsSearch::new(collections.unwrap())),
         }
     }
 }
@@ -47,21 +57,27 @@ mod col_db {
     }
 
     impl<T: AsRef<str>> SearchTrait<T> for CollectionsSearch {
-        fn search(&self, collection: usize, query: T, ordering: FoldersOrdering) -> SearchResult {
+        fn search(
+            &self,
+            collection: usize,
+            query: T,
+            ordering: FoldersOrdering,
+            group: Option<String>,
+        ) -> SearchResult {
             SearchResult {
                 files: vec![],
                 subfolders: self
                     .collections
-                    .search(collection, query, ordering)
+                    .search(collection, query, ordering, group)
                     .map_err(|e| error!("Error in collections search: {}", e))
                     .unwrap_or_else(|_| vec![]),
             }
         }
 
-        fn recent(&self, collection: usize) -> SearchResult {
+        fn recent(&self, collection: usize, group: Option<String>) -> SearchResult {
             let res = self
                 .collections
-                .recent(collection, 100)
+                .recent(collection, 100, group)
                 .map_err(|e| error!("Cannot get recents from coolection db: {}", e))
                 .unwrap_or_else(|_| vec![]);
             SearchResult {

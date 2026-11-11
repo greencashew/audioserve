@@ -19,9 +19,9 @@ const MIN_VERSION: u16 = 20;
 const FLAGS: u16 = 0b0000_1000_0000_1000;
 const COMPRESS_STORE: u16 = 0;
 
-pub fn calc_size<P, I>(sizes: I) -> Result<u64>
+pub fn calc_size<'a, P, I>(sizes: I) -> Result<u64>
 where
-    I: IntoIterator<Item = (P, u64)>,
+    I: IntoIterator<Item = (P, &'a str, u64)>,
     P: AsRef<Path>,
 {
     // let mut size: u64 = DIRECTORY_END_SIZE as u64;
@@ -31,10 +31,10 @@ where
     // Ok(size)
     sizes
         .into_iter()
-        .try_fold(DIRECTORY_END_SIZE as u64, |total, (path, sz)| {
+        .try_fold(DIRECTORY_END_SIZE as u64, |total, (_path, name, sz)| {
             Ok(total
                 + FILE_HEADER_SIZE as u64
-                + 2 * path_to_file_name(&path)?.len() as u64
+                + 2 * name.len() as u64
                 + sz
                 + DATA_DESCRIPTOR_SIZE as u64
                 + DIRECTORY_ENTRY_SIZE as u64)
@@ -58,12 +58,20 @@ pub struct FileHeader {
 }
 
 impl FileHeader {
-    pub fn new(path: impl AsRef<Path>, modified: impl Into<Timestamp>) -> Result<Self> {
+    #[allow(dead_code)]
+    pub fn new_from_path(path: impl AsRef<Path>, modified: impl Into<Timestamp>) -> Result<Self> {
         let file_name = path_to_file_name(&path)?.to_string();
         Ok(FileHeader {
             file_name,
             modified: modified.into(),
         })
+    }
+
+    pub fn new_from_name(file_name: String, modified: impl Into<Timestamp>) -> Self {
+        FileHeader {
+            file_name,
+            modified: modified.into(),
+        }
     }
 }
 
@@ -89,10 +97,10 @@ impl ToBytes for FileHeader {
         // uncompressed size
         h.put_u32_le(0);
         // file name length
-        if self.file_name.len() > std::u16::MAX as usize {
+        if self.file_name.len() > u16::MAX as usize {
             return Err(Error::FileNameTooBig);
         }
-        h.put_u16_le(self.file_name.as_bytes().len() as u16);
+        h.put_u16_le(self.file_name.len() as u16);
         // extra field length
         h.put_u16_le(0);
         // file name
@@ -117,7 +125,7 @@ impl ToBytes for Descriptor {
     fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut d = BytesMut::with_capacity(DATA_DESCRIPTOR_SIZE as usize);
 
-        if self.size > std::u32::MAX as u64 {
+        if self.size > u32::MAX as u64 {
             return Err(Error::FileTooBig(self.size));
         }
 
@@ -164,17 +172,17 @@ impl DirectoryEntry {
         // crc-32
         buf.put_u32_le(self.desc.crc);
         // compressed size
-        if self.desc.size > std::u32::MAX as u64 {
+        if self.desc.size > u32::MAX as u64 {
             return Err(Error::FileTooBig(self.desc.size));
         }
         buf.put_u32_le(self.desc.size as u32);
         // uncompressed size
         buf.put_u32_le(self.desc.size as u32);
         // file name length
-        if self.header.file_name.len() > std::u16::MAX as usize {
+        if self.header.file_name.len() > u16::MAX as usize {
             return Err(Error::FileNameTooBig);
         }
-        buf.put_u16_le(self.header.file_name.as_bytes().len() as u16);
+        buf.put_u16_le(self.header.file_name.len() as u16);
         // extra field length
         buf.put_u16_le(0);
         // file comment length
@@ -186,7 +194,7 @@ impl DirectoryEntry {
         // external file attributes
         buf.put_u32_le(0);
         // relative offset of local header
-        if self.offset > std::u32::MAX as u64 {
+        if self.offset > u32::MAX as u64 {
             return Err(Error::ArchiveTooBig);
         }
         buf.put_u32_le(self.offset as u32);
@@ -221,7 +229,7 @@ impl DirectoryEnd {
         // directory size
         buf.put_u32_le(self.dir_size);
         // directory offset from start
-        if self.dir_offset > std::u32::MAX as u64 {
+        if self.dir_offset > u32::MAX as u64 {
             return Err(Error::ArchiveTooBig);
         }
         buf.put_u32_le(self.dir_offset as u32);
@@ -275,7 +283,7 @@ impl ToBytes for Directory {
         let offset = self
             .offset
             .expect("invalid state - must update offset first");
-        if offset > std::u32::MAX as u64 {
+        if offset > u32::MAX as u64 {
             return Err(Error::ArchiveTooBig);
         }
         let end = DirectoryEnd {
@@ -287,5 +295,27 @@ impl ToBytes for Directory {
         end.add_to_bytes(&mut d)?;
 
         Ok(d.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{path::Path, time::SystemTime};
+
+    #[test]
+    fn handles_empty_file_name() {
+        let path = Path::new("/some/valid/path/");
+        let modified = SystemTime::now();
+        let result = FileHeader::new_from_path(path, modified).unwrap();
+        assert_eq!(result.file_name, "path");
+    }
+    #[test]
+    fn handles_special_characters_or_unicode() {
+        let path = Path::new("/some/valid/path/文件.txt");
+        let modified = SystemTime::now();
+        let result = FileHeader::new_from_path(path, modified).unwrap();
+
+        assert_eq!(result.file_name, "文件.txt");
     }
 }
